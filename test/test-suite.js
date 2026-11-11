@@ -516,6 +516,86 @@
         );
       }
     );
+    QUnit.test(
+      'Config-Flag tests: SAFE_FOR_TEMPLATES with RETURN_DOM and RETURN_DOM_FRAGMENT',
+      function (assert) {
+        // Template expressions assembled from adjacent text nodes (left over
+        // after element removal) have to be stripped when a DOM is returned,
+        // just like they are in string mode. See CVE-2026-41239.
+        var mustache =
+          "{<foo></foo>{constructor.constructor('alert(1)')()}<foo></foo>}";
+        var tmplit = '$<foo></foo>{alert(1)}';
+        var serializeFragment = function (fragment) {
+          var div = fragment.ownerDocument.createElement('div');
+          div.appendChild(fragment);
+          return div.innerHTML;
+        };
+
+        // String mode strips the assembled expression
+        assert.equal(
+          DOMPurify.sanitize(mustache, { SAFE_FOR_TEMPLATES: true }),
+          ' '
+        );
+
+        // RETURN_DOM
+        var dom = DOMPurify.sanitize(mustache, {
+          SAFE_FOR_TEMPLATES: true,
+          RETURN_DOM: true,
+        });
+        assert.notOk(/\{\{/.test(dom.innerHTML), 'no mustache: ' + dom.innerHTML);
+        assert.equal(dom.outerHTML, '<body> </body>');
+
+        dom = DOMPurify.sanitize(tmplit, {
+          SAFE_FOR_TEMPLATES: true,
+          RETURN_DOM: true,
+        });
+        assert.notOk(/\$\{/.test(dom.innerHTML), 'no ${: ' + dom.innerHTML);
+        assert.equal(dom.outerHTML, '<body> </body>');
+
+        // RETURN_DOM_FRAGMENT
+        var fragment = DOMPurify.sanitize(mustache, {
+          SAFE_FOR_TEMPLATES: true,
+          RETURN_DOM_FRAGMENT: true,
+        });
+        assert.equal(fragment.nodeType, 11);
+        var html = serializeFragment(fragment);
+        assert.notOk(/\{\{/.test(html), 'no mustache in fragment: ' + html);
+        assert.equal(html, ' ');
+
+        fragment = DOMPurify.sanitize(tmplit, {
+          SAFE_FOR_TEMPLATES: true,
+          RETURN_DOM_FRAGMENT: true,
+        });
+        html = serializeFragment(fragment);
+        assert.notOk(/\$\{/.test(html), 'no ${ in fragment: ' + html);
+        assert.equal(html, ' ');
+
+        // A DOM node passed in is cleaned as well
+        var input = document.createElement('div');
+        input.innerHTML = '{<foo></foo>{alert(1)}<foo></foo>}';
+        dom = DOMPurify.sanitize(input, {
+          SAFE_FOR_TEMPLATES: true,
+          RETURN_DOM: true,
+        });
+        assert.notOk(/\{\{/.test(dom.innerHTML), 'no mustache: ' + dom.innerHTML);
+        assert.notOk(/alert/.test(dom.innerHTML), 'no payload: ' + dom.innerHTML);
+
+        // Safe markup is kept and nothing changes without SAFE_FOR_TEMPLATES
+        assert.equal(
+          DOMPurify.sanitize('<a>123<b>456</b></a>', {
+            SAFE_FOR_TEMPLATES: true,
+            RETURN_DOM: true,
+          }).outerHTML,
+          '<body><a>123<b>456</b></a></body>'
+        );
+        assert.equal(
+          DOMPurify.sanitize('{<foo></foo>{1}<foo></foo>}', {
+            RETURN_DOM: true,
+          }).innerHTML,
+          '{{1}}'
+        );
+      }
+    );
     QUnit.test('Config-Flag tests: SANITIZE_DOM', function (assert) {
       // SANITIZE_DOM
       assert.equal(
