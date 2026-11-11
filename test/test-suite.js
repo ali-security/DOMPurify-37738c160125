@@ -2481,5 +2481,85 @@
         }
       }
     );
+
+    // -------------------------------------------------------------------
+    // SVG <animate>/<set> with attributeName="href" swaps a sanitized href
+    // for an attacker-controlled javascript: URL after sanitization, so
+    // such attributeName values are dropped even when animations are
+    // allowed via ADD_TAGS.
+    // -------------------------------------------------------------------
+
+    QUnit.test(
+      'Animated href test: attributeName targeting href is removed even when animations are allowed',
+      function (assert) {
+        var hrefAttr = /attributename\s*=\s*["']?[^"'>]*href/i;
+        var dirty =
+          '<svg><a><animate attributeName="href" values="x;javascript:alert(1)"></animate>' +
+          '<animate attributeName="xlink:href" values="x;javascript:alert(2)"></animate>' +
+          '<text y="20">x</text></a></svg>';
+        var clean = DOMPurify.sanitize(dirty, { ADD_TAGS: ['animate'] });
+        assert.notOk(
+          hrefAttr.test(clean),
+          'attributeName=href removed: ' + clean
+        );
+        assert.ok(
+          /<animate/i.test(clean),
+          'allowed animate element itself is kept: ' + clean
+        );
+
+        var setClean = DOMPurify.sanitize(
+          '<svg><a><set attributeName="href" to="javascript:alert(3)"></set>' +
+            '<text y="20">x</text></a></svg>',
+          { ADD_TAGS: ['set'] }
+        );
+        assert.notOk(
+          hrefAttr.test(setClean),
+          'attributeName=href removed from set: ' + setClean
+        );
+        assert.ok(
+          /<set/i.test(setClean),
+          'allowed set element is kept: ' + setClean
+        );
+
+        var benign = DOMPurify.sanitize(
+          '<svg><rect><animate attributeName="width" values="1;2"></animate></rect></svg>',
+          { ADD_TAGS: ['animate'] }
+        );
+        assert.ok(
+          /attributename\s*=\s*["']?width/i.test(benign),
+          'non-href attributeName is kept: ' + benign
+        );
+
+        var xhtml = DOMPurify.sanitize(
+          '<svg xmlns="http://www.w3.org/2000/svg"><a><animate attributeName="href" values="x;javascript:alert(4)"></animate></a></svg>',
+          {
+            ADD_TAGS: ['animate'],
+            ADD_ATTR: ['attributeName'],
+            PARSER_MEDIA_TYPE: 'application/xhtml+xml',
+          }
+        );
+        assert.notOk(
+          hrefAttr.test(xhtml),
+          'attributeName=href removed in XHTML mode: ' + xhtml
+        );
+        assert.ok(
+          /<animate/i.test(xhtml),
+          'animate element is kept in XHTML mode: ' + xhtml
+        );
+
+        try {
+          DOMPurify.addHook('uponSanitizeAttribute', function (node, data) {
+            data.forceKeepAttr = true;
+          });
+          var forced = DOMPurify.sanitize(dirty, { ADD_TAGS: ['animate'] });
+          assert.notOk(
+            hrefAttr.test(forced),
+            'attributeName=href removed even with forceKeepAttr: ' + forced
+          );
+        } finally {
+          DOMPurify.removeHooks('uponSanitizeAttribute');
+        }
+      }
+    );
   };
 });
