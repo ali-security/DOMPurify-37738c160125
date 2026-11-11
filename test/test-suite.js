@@ -434,6 +434,88 @@
         ' '
       );
     });
+    QUnit.test(
+      'Config-Flag tests: SAFE_FOR_TEMPLATES unterminated template literal mXSS',
+      function (assert) {
+        // An unterminated `${` has to be neutralized where it occurs. If it
+        // survives, the final template-safe pass over the serialized markup
+        // pairs it with a `}` from a later node and cuts out everything in
+        // between, re-shaping the output into new elements and attributes.
+        // See CVE-2025-26791.
+        var config = { SAFE_FOR_TEMPLATES: true };
+        var parse = function (html) {
+          var doc = document.implementation.createHTMLDocument('');
+          doc.body.innerHTML = html;
+          return doc.body;
+        };
+
+        var hasEventHandler = function (root) {
+          var elements = root.querySelectorAll('*');
+          for (var i = 0; i < elements.length; i++) {
+            var attributes = elements[i].attributes;
+            for (var j = 0; j < attributes.length; j++) {
+              if (/^on/i.test(attributes[j].name)) {
+                return true;
+              }
+            }
+          }
+
+          return false;
+        };
+
+        // `${` in an attribute paired with `}` in a following text node
+        var clean = DOMPurify.sanitize(
+          '<img title="${">}" src="x" onerror="alert(1)" y="<b title="q"></b>',
+          config
+        );
+        var body = parse(clean);
+        assert.notOk(hasEventHandler(body), 'no event handler attribute');
+        assert.equal(body.querySelectorAll('img').length, 1, 'single img');
+        assert.notOk(body.querySelector('img').hasAttribute('src'), 'no src');
+        assert.equal(body.querySelector('img').getAttribute('title'), ' ');
+        assert.equal(
+          clean,
+          '<img title=" ">}" src="x" onerror="alert(1)" y="<b title="q"></b>'
+        );
+
+        // `${` in a text node paired with `}` in a following attribute value
+        clean = DOMPurify.sanitize(
+          '<b>${</b><a title="}<img src=x onerror=alert(1)>">x</a>',
+          config
+        );
+        body = parse(clean);
+        assert.notOk(hasEventHandler(body), 'no event handler attribute');
+        assert.equal(body.querySelectorAll('img').length, 0, 'no img element');
+        assert.equal(body.querySelectorAll('a').length, 1, 'anchor is kept');
+        var anchor = body.querySelector('a');
+        assert.equal(
+          anchor && anchor.getAttribute('title'),
+          '}<img src=x onerror=alert(1)>',
+          'anchor title is kept'
+        );
+        assert.equal(body.querySelector('b').textContent, ' ');
+
+        // `${` assembled from two adjacent text nodes after element removal
+        clean = DOMPurify.sanitize(
+          '<b>$<foo></foo>{</b><a title="}<img src=x onerror=alert(1)>">x</a>',
+          config
+        );
+        body = parse(clean);
+        assert.notOk(hasEventHandler(body), 'no event handler attribute');
+        assert.equal(body.querySelectorAll('img').length, 0, 'no img element');
+        assert.equal(clean, '<b> ');
+
+        // A complete template literal is still removed
+        assert.equal(
+          DOMPurify.sanitize('<a>${alert(1)}</a>', config),
+          '<a> </a>'
+        );
+        assert.equal(
+          DOMPurify.sanitize('<a title="${alert(1)}"></a>', config),
+          '<a title=" "></a>'
+        );
+      }
+    );
     QUnit.test('Config-Flag tests: SANITIZE_DOM', function (assert) {
       // SANITIZE_DOM
       assert.equal(
