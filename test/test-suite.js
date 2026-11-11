@@ -1037,6 +1037,172 @@
         );
       }
     );
+
+    // CVE-2026-109345 - an IN_PLACE root that the walk itself force-removes
+    // (a rawtext root killed by the mXSS probe, a <select> root carrying a
+    // <template>, a root in a disallowed namespace, a root a hook narrowed
+    // out of the allowlist, ...) was still handed back to the caller. An
+    // attached root came back detached, a parent-less root came back
+    // untouched (_forceRemove cannot detach it); either way a rawtext root
+    // still carries its literal `</tag>`-bearing text, which re-opens markup
+    // when the returned node is serialized and re-parsed. sanitize() must
+    // fail closed instead of returning the root.
+    QUnit.test(
+      'CVE-2026-109345: throws instead of returning a force-removed rawtext root (mXSS reparse)',
+      function (assert) {
+        // A <style> passed as the IN_PLACE root whose text content already
+        // carries its own end tag is force-removed by the mXSS probe: its
+        // literal serialization ("</style><img ...>") re-opens markup on an
+        // HTML reparse. Attribute sanitization cannot defang rawtext text, so
+        // the detached root must not be handed back to the caller. Assert the
+        // return contract, not merely a scrubbed textContent.
+        var dirty = document.createElement('style');
+        dirty.setAttribute('onclick', 'alert(1)');
+        dirty.textContent = '</style><img src=x onerror=alert(1)>';
+        document.body.appendChild(dirty);
+
+        assert.throws(
+          function () {
+            DOMPurify.sanitize(dirty, { IN_PLACE: true });
+          },
+          /refusing to sanitize in place/,
+          'force-removed rawtext root is not returned'
+        );
+        assert.ok(
+          DOMPurify.removed.some(function (entry) {
+            return entry.element === dirty;
+          }),
+          'root was recorded as removed during the aborted call'
+        );
+
+        if (dirty.parentNode) {
+          dirty.parentNode.removeChild(dirty);
+        }
+        window.xssed = false;
+      }
+    );
+    QUnit.test(
+      'CVE-2026-109345: still returns the root when a rawtext CHILD (not the root) is removed',
+      function (assert) {
+        // The fail-closed guard must fire ONLY when the ROOT itself is
+        // force-removed. A dangerous rawtext child is detached from the
+        // returned root as usual; the root remains safe to return, so the
+        // guard must not over-trigger on ordinary child removals.
+        var dirty = document.createElement('div');
+        dirty.innerHTML = '<span>ok</span>';
+        var style = document.createElement('style');
+        style.textContent = '</style><img src=x onerror=alert(1)>';
+        dirty.appendChild(style);
+        document.body.appendChild(dirty);
+
+        var clean = DOMPurify.sanitize(dirty, { IN_PLACE: true });
+        assert.equal(clean, dirty, 'returns the input root');
+        assert.equal(
+          dirty.querySelector('style'),
+          null,
+          'dangerous rawtext child removed from the returned root'
+        );
+        assert.equal(
+          dirty.querySelector('span').textContent,
+          'ok',
+          'safe sibling content preserved'
+        );
+
+        if (dirty.parentNode) {
+          dirty.parentNode.removeChild(dirty);
+        }
+        window.xssed = false;
+      }
+    );
+    QUnit.test(
+      'CVE-2026-109345: throws instead of returning a parent-less force-removed rawtext root',
+      function (assert) {
+        // _forceRemove cannot detach a root that has no parent, so the kill
+        // decision of the mXSS probe used to be a silent no-op and the caller
+        // got the intact, payload-bearing <style> back. Re-parsing its
+        // serialization then yields a live <img onerror>.
+        var dirty = document.createElement('style');
+        dirty.textContent = '</style><img onerror="window.__cve109345 = 1">';
+
+        var returned = null;
+        var threw = false;
+        try {
+          returned = DOMPurify.sanitize(dirty, { IN_PLACE: true });
+        } catch (error) {
+          threw = /refusing to sanitize in place/.test(error.message);
+        }
+
+        assert.ok(threw, 'parent-less force-removed rawtext root is not returned');
+        assert.ok(
+          DOMPurify.removed.some(function (entry) {
+            return entry.element === dirty;
+          }),
+          'root was recorded as removed during the aborted call'
+        );
+
+        // Store-and-rerender of whatever the caller got back must expose no
+        // executable sink. Re-parse in an inert document so nothing loads.
+        if (returned) {
+          var probe = document.implementation
+            .createHTMLDocument('')
+            .createElement('div');
+          probe.innerHTML = returned.outerHTML;
+          assert.notOk(
+            probe.querySelector('[onerror],[onload],script'),
+            'no executable sink survives serialize/reparse: ' + probe.innerHTML
+          );
+        }
+      }
+    );
+    QUnit.test(
+      'CVE-2026-109345: throws for every root-kill reason, attached or parent-less',
+      function (assert) {
+        // The guard keys on the removal record, not on one probe, so every
+        // reason the walk can decide to kill the root fails closed.
+        var reasons = [
+          {
+            label: '<select> root carrying a <template>',
+            make: function () {
+              var root = document.createElement('select');
+              var tpl = document.createElement('template');
+              root.appendChild(tpl);
+              return root;
+            },
+          },
+          {
+            label: 'SVG-namespace root that is not <svg>',
+            make: function () {
+              var root = document.createElementNS(
+                'http://www.w3.org/2000/svg',
+                'a'
+              );
+              root.setAttribute('onclick', 'window.__cve109345 = 1');
+              return root;
+            },
+          },
+        ];
+
+        reasons.forEach(function (reason) {
+          [true, false].forEach(function (attached) {
+            var root = reason.make();
+            var host = document.createElement('div');
+            if (attached) {
+              host.appendChild(root);
+            }
+
+            assert.throws(
+              function () {
+                DOMPurify.sanitize(root, { IN_PLACE: true });
+              },
+              /refusing to sanitize in place/,
+              (attached ? 'attached ' : 'parent-less ') +
+                reason.label +
+                ' is not returned'
+            );
+          });
+        });
+      }
+    );
     QUnit.test('Config-Flag tests: FORBID_TAGS', function (assert) {
       //FORBID_TAGS
       assert.equal(
@@ -3769,7 +3935,16 @@
             payload.appendChild(document.createTextNode('kept'));
             root.appendChild(payload);
 
-            purify.sanitize(root, { IN_PLACE: true });
+            // The walk decides to kill the root, which _forceRemove cannot
+            // detach, so sanitize() fails closed (CVE-2026-109345) instead
+            // of returning it. The KEEP_CONTENT invariants still hold.
+            assert.throws(
+              function () {
+                purify.sanitize(root, { IN_PLACE: true });
+              },
+              /refusing to sanitize in place/,
+              'the force-removed parent-less root is not returned'
+            );
 
             assert.equal(
               clobber.childNodes.length,

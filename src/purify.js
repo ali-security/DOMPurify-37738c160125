@@ -2012,6 +2012,32 @@ function createDOMPurify(window = getGlobal()) {
 
     /* If we sanitized `dirty` in-place, return it. */
     if (IN_PLACE) {
+      /* Detect the one shape no in-place scrub can make safe: the in-place
+         ROOT was itself force-removed during the walk (a rawtext root killed
+         by the mXSS probe, a clobbered root, a root in a disallowed
+         namespace, ...). Such a root is detached - or, without a parent,
+         left untouched by _forceRemove - and, for a rawtext element, still
+         carries a literal `</tag>`-bearing text payload that attribute
+         sanitization does not touch, so re-serialising and re-parsing the
+         returned node re-opens the markup. There is no safe node to hand
+         back, so fail closed - identical in spirit to the clobbered-root
+         throw at the IN_PLACE entry. Covers every present and future
+         root-kill reason in one check, on both the attribute and text
+         axes. */
+      let rootWasRemoved = false;
+      arrayForEach(DOMPurify.removed, (entry) => {
+        if (entry.element === dirty) {
+          rootWasRemoved = true;
+        }
+      });
+
+      if (rootWasRemoved) {
+        throw typeErrorCreate(
+          'a node selected for removal could not be safely returned; ' +
+            'refusing to sanitize in place'
+        );
+      }
+
       return dirty;
     }
 
