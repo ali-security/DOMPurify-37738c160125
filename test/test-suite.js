@@ -3028,7 +3028,7 @@
     );
 
     QUnit.test(
-      'GHSA-hpcv-96wg-7vj8: cross-realm form with clobbered nodeType is sanitized in-place, not stringified',
+      'GHSA-hpcv-96wg-7vj8: cross-realm form with clobbered nodeType is refused in-place, not stringified',
       function (assert) {
         var ran = _withForeignRealmDocHpcv(function (idoc) {
           var root = idoc.createElement('form');
@@ -3050,12 +3050,23 @@
           // does not apply), reported it as a non-node, and sanitize()
           // stringified it - returning a string and leaving the caller's
           // form, onmouseover included, untouched.
-          var clean = DOMPurify.sanitize(root, { IN_PLACE: true });
-
-          assert.strictEqual(clean, root, 'root is returned in-place');
-          assert.notOk(
-            root.hasAttribute('onmouseover'),
-            'onmouseover removed from foreign-realm root'
+          // _isNode now recognises the form as a node, and the nodeType
+          // probe in _isClobbered (GHSA-76mc-f452-cxcm) flags it as
+          // clobbered, so the IN_PLACE preamble refuses the root the same
+          // way it refuses any other clobbered form root
+          // (GHSA-r47g-fvhr-h676) instead of returning a string.
+          var returned;
+          assert.throws(
+            function () {
+              returned = DOMPurify.sanitize(root, { IN_PLACE: true });
+            },
+            /clobbered/i,
+            'nodeType-clobbered foreign-realm IN_PLACE root must throw'
+          );
+          assert.notEqual(
+            typeof returned,
+            'string',
+            'sanitize() did not stringify the foreign-realm root'
           );
         });
         if (!ran) {
@@ -3241,6 +3252,433 @@
         if (!ran) {
           assert.ok(true, 'SKIP: cannot construct a foreign-realm document');
         }
+      }
+    );
+
+    // ---------------------------------------------------------------------------
+    // Hook-driven allowlist pollution (GHSA-76mc-f452-cxcm).
+    //
+    // Before this fix: The data.allowedTags / data.allowedAttributes
+    // fields passed to uponSanitizeElement / uponSanitizeAttribute hooks were
+    // direct references to the live ALLOWED_TAGS / ALLOWED_ATTR sets. When no
+    // explicit cfg.ALLOWED_TAGS was supplied, that live set WAS the
+    // module-level DEFAULT_ALLOWED_TAGS constant. A hook that wrote
+    //     data.allowedTags['script'] = true
+    // therefore wrote permanently into the default constant. Subsequent
+    // sanitize calls — even after removeAllHooks() and clearConfig() —
+    // inherited the widened defaults until the entire DOMPurify instance
+    // was recreated.
+    //
+    // Fix: when any uponSanitize* hook is registered, the allowlist sets are
+    // cloned for the duration of the call. The hook then mutates the clone,
+    // preserving the documented in-call widening behavior (the test
+    // "ensure that a hook can add allowed tags / attributes on the fly"
+    // continues to pass), while the next default-cfg call rebinds to the
+    // untouched default.
+    // ---------------------------------------------------------------------------
+
+    QUnit.module(
+      'Hook-driven allowlist pollution (GHSA-76mc-f452-cxcm)',
+      function (hooks) {
+        var purify;
+        hooks.beforeEach(function () {
+          // Fresh instance per test — the bug under test IS cross-call
+          // pollution, so test isolation requires per-test instances.
+          purify = DOMPurify(window);
+        });
+        hooks.afterEach(function () {
+          purify.removeAllHooks();
+          purify.clearConfig();
+        });
+
+        QUnit.test(
+          'baseline: <script> and onclick are stripped under default config',
+          function (assert) {
+            assert.equal(
+              purify.sanitize('<svg><script>alert(1)</script></svg>'),
+              '<svg></svg>',
+              'fresh default sanitize strips <script>'
+            );
+            assert.equal(
+              purify.sanitize('<a onclick="alert(1)">x</a>'),
+              '<a>x</a>',
+              'fresh default sanitize strips onclick'
+            );
+          }
+        );
+
+        QUnit.test(
+          'in-call widening via hook still works (documented behavior preserved)',
+          function (assert) {
+            // This mirrors the test "ensure that a hook can add allowed
+            // tags / attributes on the fly" and asserts that the pollution
+            // fix did not break the documented hook-widening API. The fix
+            // preserves in-call widening by handing the hook a clone of the
+            // default; the clone is mutated and used for the rest of the
+            // iteration.
+            purify.addHook('uponSanitizeElement', function (node, data) {
+              if (data.tagName === 'is-custom') {
+                data.allowedTags['is-custom'] = true;
+              }
+            });
+            purify.addHook('uponSanitizeAttribute', function (node, data) {
+              if (data.attrName === 'super-custom') {
+                data.allowedAttributes['super-custom'] = true;
+              }
+            });
+
+            var input =
+              '<p>HE<is-custom super-custom="test">LLO</is-custom></p>';
+            assert.equal(
+              purify.sanitize(input),
+              input,
+              'guarded hook widens allowlist for matching element in-call'
+            );
+          }
+        );
+
+        QUnit.test(
+          'unguarded element hook does not poison subsequent default-config calls',
+          function (assert) {
+            purify.addHook('uponSanitizeElement', function (node, data) {
+              // The "leaky" pattern: unconditionally widen.
+              data.allowedTags['script'] = true;
+            });
+
+            // First call: hook is active. In-call widening works (mirrors
+            // the documented behavior), so script survives.
+            assert.equal(
+              purify.sanitize('<svg><script>1</script></svg>'),
+              '<svg><script>1</script></svg>',
+              'in-call widening still works while hook is registered'
+            );
+
+            purify.removeAllHooks();
+            purify.clearConfig();
+
+            // Second call after hook removal: the bug. Pre-fix, the module
+            // default has been polluted and <script> still passes. Post-fix,
+            // the default was never touched (only the per-call clone was)
+            // and <script> is correctly stripped.
+            assert.equal(
+              purify.sanitize('<svg><script>alert(1)</script></svg>'),
+              '<svg></svg>',
+              'default sanitize after element-hook removal strips <script>'
+            );
+          }
+        );
+
+        QUnit.test(
+          'unguarded attribute hook does not poison subsequent default-config calls',
+          function (assert) {
+            purify.addHook('uponSanitizeAttribute', function (node, data) {
+              data.allowedAttributes['onclick'] = true;
+            });
+
+            // In-call widening works.
+            assert.ok(
+              purify
+                .sanitize('<a onclick="alert(1)">x</a>')
+                .indexOf('onclick') !== -1,
+              'in-call widening still works for attribute hook'
+            );
+
+            purify.removeAllHooks();
+            purify.clearConfig();
+
+            assert.equal(
+              purify.sanitize('<a onclick="alert(1)">x</a>'),
+              '<a>x</a>',
+              'default sanitize after attr-hook removal strips onclick'
+            );
+          }
+        );
+
+        QUnit.test(
+          'pollution does not cross instance boundaries',
+          function (assert) {
+            // Pollute the first instance.
+            purify.addHook('uponSanitizeElement', function (node, data) {
+              data.allowedTags['script'] = true;
+            });
+            purify.sanitize('<svg><script>alert(1)</script></svg>');
+
+            // A separately-constructed instance must not inherit the
+            // (now-fixed-or-not) state of the first instance.
+            var freshInstance = DOMPurify(window);
+            assert.equal(
+              freshInstance.sanitize('<svg><script>alert(1)</script></svg>'),
+              '<svg></svg>',
+              'fresh DOMPurify instance must not inherit poisoned defaults'
+            );
+          }
+        );
+
+        QUnit.test(
+          'read-only hook does not poison defaults',
+          function (assert) {
+            // Pure-read access to data.allowedTags is the safest hook
+            // pattern and must continue to work. The fix's pre-clone is
+            // harmless here — the hook reads from a clone, then the clone
+            // is discarded at call end.
+            var sawScriptKey;
+            purify.addHook('uponSanitizeElement', function (node, data) {
+              if (sawScriptKey === undefined) {
+                sawScriptKey = 'script' in data.allowedTags;
+              }
+            });
+
+            purify.sanitize('<div><span>hi</span></div>');
+
+            assert.strictEqual(
+              sawScriptKey,
+              false,
+              'hook sees default allowlist with script NOT included'
+            );
+
+            purify.removeAllHooks();
+            purify.clearConfig();
+
+            assert.equal(
+              purify.sanitize('<svg><script>alert(1)</script></svg>'),
+              '<svg></svg>',
+              'read-only hook does not poison defaults'
+            );
+          }
+        );
+
+        QUnit.test(
+          'multiple polluting calls do not accumulate state in defaults',
+          function (assert) {
+            // Stress: many calls with a polluting hook, then check recovery.
+            // Each call gets a fresh clone; the clones are discarded at call
+            // end; module defaults stay clean.
+            purify.addHook('uponSanitizeElement', function (node, data) {
+              data.allowedTags['script'] = true;
+              data.allowedTags['iframe'] = true;
+              data.allowedTags['object'] = true;
+            });
+
+            for (var i = 0; i < 10; i++) {
+              purify.sanitize('<div></div>');
+            }
+
+            purify.removeAllHooks();
+            purify.clearConfig();
+
+            assert.equal(
+              purify.sanitize('<svg><script>1</script></svg>'),
+              '<svg></svg>',
+              'script still stripped after 10 polluting calls'
+            );
+            assert.equal(
+              purify.sanitize('<iframe src="x"></iframe>'),
+              '',
+              'iframe still stripped after 10 polluting calls'
+            );
+            assert.equal(
+              purify.sanitize('<object data="x"></object>'),
+              '',
+              'object still stripped after 10 polluting calls'
+            );
+          }
+        );
+
+        QUnit.test(
+          'explicit cfg.ALLOWED_TAGS path is unaffected by hook mutation in other calls',
+          function (assert) {
+            // When cfg.ALLOWED_TAGS is supplied, ALLOWED_TAGS is already a
+            // per-call fresh object (built via addToSet({}, ...)), not the
+            // module default. Hooks mutating it can't pollute the default
+            // even pre-fix. Asserting this explicitly catches a hypothetical
+            // over-correction that breaks the explicit-cfg path.
+            purify.addHook('uponSanitizeElement', function (node, data) {
+              data.allowedTags['script'] = true;
+            });
+
+            // First call: explicit restrictive cfg, hook widens, script
+            // survives in-call.
+            var withCfg = purify.sanitize(
+              '<svg><script>alert(1)</script></svg>',
+              { ALLOWED_TAGS: ['svg'] }
+            );
+            assert.ok(
+              withCfg.indexOf('<script>') !== -1,
+              'explicit-cfg call respects in-call hook widening: ' + withCfg
+            );
+
+            purify.removeAllHooks();
+            purify.clearConfig();
+
+            // Default call afterwards must still be clean.
+            assert.equal(
+              purify.sanitize('<svg><script>alert(1)</script></svg>'),
+              '<svg></svg>',
+              'default-cfg call after explicit-cfg+hook is unaffected'
+            );
+          }
+        );
+      }
+    );
+
+    // ---------------------------------------------------------------------------
+    // Residual DOM-clobbering surfaces (GHSA-76mc-f452-cxcm).
+    //
+    // HTMLFormElement has [LegacyOverrideBuiltIns], so a named descendant
+    // shadows any prototype property read directly off the form:
+    //   - <input name="nodeType"> makes form.nodeType return the input. The
+    //     mXSS / PI / comment branches of _sanitizeElements compare
+    //     currentNode.nodeType directly, so _isClobbered now compares the
+    //     direct read against the cached Node.prototype.nodeType getter.
+    //   - <input name="parentNode"> makes form.parentNode return the input.
+    //     The KEEP_CONTENT branch used to fall back to currentNode.parentNode
+    //     when the cached getter returned null (a parent-less IN_PLACE root),
+    //     re-parenting the root's children into the attacker's named child.
+    //     The fallback is gone; only the cached getters are used.
+    // ---------------------------------------------------------------------------
+
+    var _formClobbers76mc = function (name) {
+      var form = document.createElement('form');
+      var input = document.createElement('input');
+      input.setAttribute('name', name);
+      form.appendChild(input);
+      return form[name] === input;
+    };
+
+    QUnit.module(
+      'DOM clobbering via nodeType / parentNode (GHSA-76mc-f452-cxcm)',
+      function (hooks) {
+        var purify;
+        hooks.beforeEach(function () {
+          purify = DOMPurify(window);
+        });
+        hooks.afterEach(function () {
+          purify.removeAllHooks();
+          purify.clearConfig();
+        });
+
+        QUnit.test(
+          'form clobbered by <input name="nodeType"> is removed from string input',
+          function (assert) {
+            if (!_formClobbers76mc('nodeType')) {
+              assert.ok(true, 'SKIP: no form clobbering in this engine');
+              return;
+            }
+
+            assert.equal(
+              purify.sanitize(
+                '<form onsubmit=alert(1)><input onfocus=alert(2) name=nodeType>123</form>'
+              ),
+              '',
+              'nodeType-clobbered form must be detected as clobbered and removed'
+            );
+          }
+        );
+
+        QUnit.test(
+          'form clobbered by <input name="nodeType"> inside an IN_PLACE tree is removed',
+          function (assert) {
+            if (!_formClobbers76mc('nodeType')) {
+              assert.ok(true, 'SKIP: no form clobbering in this engine');
+              return;
+            }
+
+            var wrapper = document.createElement('div');
+            var form = document.createElement('form');
+            form.setAttribute('onmouseover', 'window.__rooted_76mc = 1');
+            var clobber = document.createElement('input');
+            clobber.setAttribute('name', 'nodeType');
+            form.appendChild(clobber);
+            wrapper.appendChild(form);
+
+            purify.sanitize(wrapper, { IN_PLACE: true });
+
+            assert.equal(
+              wrapper.querySelectorAll('form').length,
+              0,
+              'nodeType-clobbered form must be removed from the IN_PLACE tree'
+            );
+          }
+        );
+
+        QUnit.test(
+          'IN_PLACE root clobbered by <input name="nodeType"> throws',
+          function (assert) {
+            if (!_formClobbers76mc('nodeType')) {
+              assert.ok(true, 'SKIP: no form clobbering in this engine');
+              return;
+            }
+
+            var root = document.createElement('form');
+            root.setAttribute('onmouseover', 'window.__rooted_76mc = 1');
+            var clobber = document.createElement('input');
+            clobber.setAttribute('name', 'nodeType');
+            root.appendChild(clobber);
+
+            assert.throws(
+              function () {
+                purify.sanitize(root, { IN_PLACE: true });
+              },
+              /clobbered/i,
+              'nodeType-clobbered IN_PLACE root must throw'
+            );
+          }
+        );
+
+        QUnit.test(
+          'unclobbered form is still kept (no false positive from the nodeType probe)',
+          function (assert) {
+            assert.equal(
+              purify.sanitize(
+                '<form onsubmit=alert(1)><input name=username>123</form>'
+              ),
+              '<form><input name="username">123</form>',
+              'plain form survives sanitization'
+            );
+          }
+        );
+
+        QUnit.test(
+          'KEEP_CONTENT does not re-parent children into a clobbered parentNode',
+          function (assert) {
+            if (!_formClobbers76mc('parentNode')) {
+              assert.ok(true, 'SKIP: no form clobbering in this engine');
+              return;
+            }
+
+            // A hook narrows the allowlist for the form, so the parent-less
+            // IN_PLACE root reaches the KEEP_CONTENT branch. Its cached
+            // parentNode is null; the old `|| currentNode.parentNode`
+            // fallback then read the clobbered property and inserted clones
+            // of the root's children into the attacker's named child.
+            purify.addHook('uponSanitizeElement', function (node, data) {
+              if (data.tagName === 'form') {
+                delete data.allowedTags.form;
+              }
+            });
+
+            var root = document.createElement('form');
+            var clobber = document.createElement('input');
+            clobber.setAttribute('name', 'parentNode');
+            root.appendChild(clobber);
+            var payload = document.createElement('b');
+            payload.appendChild(document.createTextNode('kept'));
+            root.appendChild(payload);
+
+            purify.sanitize(root, { IN_PLACE: true });
+
+            assert.equal(
+              clobber.childNodes.length,
+              0,
+              'no clones were inserted into the clobbering named child'
+            );
+            assert.equal(
+              root.querySelectorAll('b').length,
+              1,
+              'the root still holds exactly one copy of its content'
+            );
+          }
+        );
       }
     );
   };
