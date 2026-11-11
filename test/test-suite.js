@@ -4325,5 +4325,295 @@
         }
       }
     );
+
+    // ---------------------------------------------------------------------------
+    // CVE-2026-75838 (GHSA-55q2-fjhq-7xh7): a hook that detaches a node via
+    // node.remove() (the documented removal pattern) takes the subtree out of
+    // the tree before the walker reaches its descendants, and hook-detached
+    // nodes are not recorded in DOMPurify.removed. On the IN_PLACE path the
+    // caller built that subtree in the live document, so a descendant that was
+    // already loading kept its queued on* handler and fired in page scope after
+    // sanitize returned, even though the returned tree was clean. Every
+    // per-node hook site that can detach the node now neutralizes the
+    // detached subtree. The ownerDocument read that builds the iterator is
+    // clobber-safe too, so a clobbered form root can no longer abort the walk
+    // before a single node is scrubbed.
+    // ---------------------------------------------------------------------------
+
+    QUnit.module('IN_PLACE: hook-detached subtrees (CVE-2026-75838)', function (
+      hooks
+    ) {
+      var purify;
+      hooks.beforeEach(function () {
+        purify = DOMPurify(window);
+      });
+      hooks.afterEach(function () {
+        purify.removeAllHooks();
+        purify.clearConfig();
+      });
+
+      var detachingHooks = [
+        'uponSanitizeElement',
+        'beforeSanitizeElements',
+        'afterSanitizeElements',
+        'beforeSanitizeAttributes',
+        'afterSanitizeAttributes',
+      ];
+
+      detachingHooks.forEach(function (hook) {
+        QUnit.test(
+          'CVE-2026-75838: IN_PLACE ' +
+            hook +
+            ' node.remove() neutralizes the detached subtree',
+          function (assert) {
+            var root = document.createElement('div');
+            root.innerHTML =
+              '<section><img id="tail" onerror="window.__cve75838 = 1"></section>' +
+              '<div>safe</div>';
+            var tail = root.querySelector('#tail');
+
+            purify.addHook(hook, function (node) {
+              if (node.nodeName === 'SECTION') {
+                node.remove();
+              }
+            });
+
+            var ret = purify.sanitize(root, { IN_PLACE: true });
+
+            assert.equal(ret, root, 'returns the same in-place node');
+            assert.notOk(
+              ret.querySelector('section, #tail'),
+              'detached subtree is absent from the returned tree'
+            );
+            assert.strictEqual(
+              tail.getAttribute('onerror'),
+              null,
+              'on* handler stripped from the hook-detached descendant'
+            );
+
+            // App-side store-and-rerender must expose no executable sink.
+            var probe = document.createElement('div');
+            probe.innerHTML = ret.outerHTML + tail.outerHTML;
+            assert.notOk(
+              probe.querySelector('[onerror],[onload],script'),
+              'no executable sink survives serialize/reparse: ' +
+                probe.innerHTML
+            );
+          }
+        );
+
+        QUnit.test(
+          'CVE-2026-75838: IN_PLACE ' +
+            hook +
+            ' node.remove() leaves no loading handler to fire after sanitize',
+          function (assert) {
+            var done = assert.async();
+            var sentinel = '__cve75838_' + hook;
+            window[sentinel] = 0;
+
+            // The <img> starts loading (and fails) as soon as the markup is
+            // parsed in the live document, before sanitize runs; its error
+            // event is queued and fires after sanitize returns.
+            var root = document.createElement('div');
+            root.innerHTML =
+              '<section><p><img src="data:,x" onerror="window.' +
+              sentinel +
+              ' = 1"></p></section><div>safe</div>';
+
+            purify.addHook(hook, function (node) {
+              if (node.nodeName === 'SECTION') {
+                node.remove();
+              }
+            });
+
+            purify.sanitize(root, { IN_PLACE: true });
+
+            assert.notOk(
+              root.querySelector('section, img'),
+              'detached subtree is absent from the returned tree'
+            );
+
+            setTimeout(function () {
+              assert.strictEqual(
+                window[sentinel],
+                0,
+                'handler of the hook-detached <img> must not fire in page scope'
+              );
+              delete window[sentinel];
+              done();
+            }, 500);
+          }
+        );
+      });
+
+      // The afterSanitizeElements site that runs on a custom element kept via
+      // CUSTOM_ELEMENT_HANDLING (GHSA-c2j3-45gr-mqc4) is a separate hook site
+      // from the normal-element tail and needs the same detach re-check.
+      QUnit.test(
+        'CVE-2026-75838: IN_PLACE afterSanitizeElements node.remove() on a kept custom element neutralizes the detached subtree',
+        function (assert) {
+          var root = document.createElement('div');
+          root.innerHTML =
+            '<x-wrap><img id="tail" onerror="window.__cve75838 = 1"></x-wrap>' +
+            '<div>safe</div>';
+          var tail = root.querySelector('#tail');
+
+          purify.addHook('afterSanitizeElements', function (node) {
+            if (node.nodeName === 'X-WRAP') {
+              node.remove();
+            }
+          });
+
+          var ret = purify.sanitize(root, {
+            IN_PLACE: true,
+            CUSTOM_ELEMENT_HANDLING: { tagNameCheck: /^x-/ },
+          });
+
+          assert.equal(ret, root, 'returns the same in-place node');
+          assert.notOk(
+            ret.querySelector('x-wrap, #tail'),
+            'detached subtree is absent from the returned tree'
+          );
+          assert.strictEqual(
+            tail.getAttribute('onerror'),
+            null,
+            'on* handler stripped from the hook-detached descendant'
+          );
+        }
+      );
+
+      // Allowlisted attributes of the detached subtree are left alone, and
+      // a hook that detaches nothing changes nothing.
+      QUnit.test(
+        'CVE-2026-75838: IN_PLACE neutralization only strips non-allow-listed attributes',
+        function (assert) {
+          var root = document.createElement('div');
+          root.innerHTML =
+            '<section title="t"><a id="tail" href="https://example.com/" ' +
+            'class="c" onclick="window.__cve75838 = 1">x</a></section>' +
+            '<p class="kept">safe</p>';
+          var tail = root.querySelector('#tail');
+
+          purify.addHook('uponSanitizeElement', function (node) {
+            if (node.nodeName === 'SECTION') {
+              node.remove();
+            }
+          });
+
+          purify.sanitize(root, { IN_PLACE: true });
+
+          assert.strictEqual(tail.getAttribute('onclick'), null);
+          assert.strictEqual(
+            tail.getAttribute('href'),
+            'https://example.com/',
+            'allow-listed href is kept on the detached descendant'
+          );
+          assert.strictEqual(tail.getAttribute('class'), 'c');
+          assert.equal(
+            root.innerHTML,
+            '<p class="kept">safe</p>',
+            'the attached remainder is sanitized as usual'
+          );
+        }
+      );
+
+      // The walk root itself is exempt: a hook that detaches the IN_PLACE
+      // root does not stop the walk from sanitizing it.
+      QUnit.test(
+        'CVE-2026-75838: IN_PLACE root detached by a hook is still fully sanitized',
+        function (assert) {
+          var host = document.createElement('div');
+          var root = document.createElement('div');
+          root.innerHTML = '<img onerror="window.__cve75838 = 1"><b>ok</b>';
+          host.appendChild(root);
+
+          purify.addHook('beforeSanitizeElements', function (node) {
+            if (node === root) {
+              node.remove();
+            }
+          });
+
+          var ret = purify.sanitize(root, { IN_PLACE: true });
+
+          assert.equal(ret, root, 'returns the same in-place node');
+          assert.equal(root.innerHTML, '<img><b>ok</b>');
+        }
+      );
+
+      QUnit.test(
+        'CVE-2026-75838: IN_PLACE a clobbered ownerDocument does not skip the scrub',
+        function (assert) {
+          // HTMLFormElement has [LegacyOverrideBuiltIns], so a child
+          // <input name="ownerDocument"> shadows Node.prototype.ownerDocument
+          // and a direct form.ownerDocument read returns that <input>. The
+          // iterator was built with createNodeIterator.call(root.ownerDocument),
+          // which then threw before a single node was visited, leaving an
+          // armed descendant un-neutralized in the caller's live tree. jsdom
+          // does not implement the form named-getter override, so reproduce it
+          // faithfully: an own accessor shadowing the prototype getter is
+          // exactly what [LegacyOverrideBuiltIns] surfaces.
+          var root = document.createElement('form');
+          var img = document.createElement('img');
+          img.setAttribute('onerror', 'window.__cve75838 = 1'); // no src: assert the attr, not a load
+          root.appendChild(img);
+          document.body.appendChild(root);
+
+          var fake = document.createElement('input');
+          Object.defineProperty(root, 'ownerDocument', {
+            get: function () {
+              return fake;
+            },
+            configurable: true,
+          });
+          assert.strictEqual(
+            root.ownerDocument,
+            fake,
+            'precondition: ownerDocument read is clobbered'
+          );
+
+          // The security invariant holds whether the call returns or throws:
+          // the armed handler must be gone either way.
+          try {
+            purify.sanitize(root, { IN_PLACE: true });
+          } catch (_) {}
+
+          assert.strictEqual(
+            img.getAttribute('onerror'),
+            null,
+            'armed on* handler stripped despite the ownerDocument clobber'
+          );
+
+          delete root.ownerDocument;
+          root.remove();
+        }
+      );
+
+      QUnit.test(
+        'CVE-2026-75838: IN_PLACE form with a natural ownerDocument-clobbering child stays safe',
+        function (assert) {
+          // The real-vector form of the test above. In a clobbering-capable
+          // engine the named child makes root.ownerDocument return the input;
+          // in jsdom it does not, and the branch just documents that. Either
+          // way, no on* handler may survive.
+          var root = document.createElement('form');
+          root.innerHTML =
+            '<input name="ownerDocument"><img onerror="window.__cve75838 = 1">';
+          document.body.appendChild(root);
+
+          var clobbers = root.ownerDocument !== document;
+          try {
+            purify.sanitize(root, { IN_PLACE: true });
+          } catch (_) {}
+
+          assert.notOk(
+            /onerror/i.test(root.outerHTML),
+            clobbers
+              ? 'clobbering engine: on-handler stripped'
+              : 'non-clobbering engine: on-handler stripped'
+          );
+          root.remove();
+        }
+      );
+    });
   };
 });

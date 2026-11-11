@@ -154,6 +154,14 @@ function createDOMPurify(window = getGlobal()) {
     Node && Node.prototype ? lookupGetter(Node.prototype, 'nodeType') : null;
   const getNodeName =
     Node && Node.prototype ? lookupGetter(Node.prototype, 'nodeName') : null;
+  const getOwnerDocument =
+    Node && Node.prototype
+      ? lookupGetter(Node.prototype, 'ownerDocument')
+      : null;
+  const removeAttributeNode = lookupGetter(
+    ElementPrototype,
+    'removeAttributeNode'
+  );
   const getShadowRoot =
     'shadowRoot' in ElementPrototype
       ? lookupGetter(ElementPrototype, 'shadowRoot')
@@ -953,8 +961,17 @@ function createDOMPurify(window = getGlobal()) {
    * @return {Iterator} iterator instance
    */
   const _createIterator = function (root) {
+    /* Read ownerDocument through the cached Node.prototype getter, never the
+       direct property. HTMLFormElement has [LegacyOverrideBuiltIns], so a
+       clobbering child (<input name="ownerDocument">) shadows the prototype
+       getter and makes a direct read return that <input>.
+       createNodeIterator.call(<input>, ...) then throws "Illegal invocation"
+       before a single node is visited, leaving the caller's IN_PLACE tree,
+       with any already-armed handler in it, unsanitized. The cached getter
+       returns the real Document regardless of the clobber. */
+    const doc = getOwnerDocument ? getOwnerDocument(root) : root.ownerDocument;
     return createNodeIterator.call(
-      root.ownerDocument || root,
+      doc || root,
       root,
       // eslint-disable-next-line no-bitwise
       NodeFilter.SHOW_ELEMENT |
@@ -1172,6 +1189,91 @@ function createDOMPurify(window = getGlobal()) {
   };
 
   /**
+   * _stripDisallowedAttributes
+   * Remove every attribute of an element that the attribute allowlist
+   * rejects. Hook-free and not recorded in DOMPurify.removed: it only runs
+   * on nodes that already left the tree being sanitized. All reads go
+   * through the cached prototype getters so a clobbering form cannot hide
+   * an attribute from the scrub.
+   *
+   * @param  {Element} element element to scrub
+   */
+  const _stripDisallowedAttributes = function (element) {
+    const attributes = getAttributes(element);
+    if (!attributes) {
+      return;
+    }
+
+    const lcTag = transformCaseFunc(_getNodeName(element));
+    let l = attributes.length;
+    while (l--) {
+      const attr = attributes[l];
+      if (!attr) {
+        continue;
+      }
+
+      const { name } = attr;
+      const value = name === 'value' ? attr.value : stringTrim(attr.value);
+      if (!_isValidAttribute(lcTag, transformCaseFunc(name), value)) {
+        try {
+          removeAttributeNode(element, attr);
+        } catch (_) {}
+      }
+    }
+  };
+
+  /**
+   * _neutralizeSubtree
+   * Strip the non-allow-listed attributes (on* handlers, script URIs, ...)
+   * from every element of a subtree, the subtree root included. Iterative,
+   * so a deeply nested subtree cannot exhaust the stack.
+   *
+   * @param  {Node} node root of the subtree to neutralize
+   */
+  const _neutralizeSubtree = function (node) {
+    const stack = [node];
+    while (stack.length > 0) {
+      const current = arrayPop(stack);
+      const nodeType = getNodeType ? getNodeType(current) : current.nodeType;
+      if (nodeType === 1) {
+        _stripDisallowedAttributes(current);
+      }
+
+      const childNodes = getChildNodes(current);
+      let i = childNodes ? childNodes.length : 0;
+      while (i--) {
+        arrayPush(stack, childNodes[i]);
+      }
+    }
+  };
+
+  /**
+   * _neutralizeHookDetachedNode
+   * A hook may detach the node it is handed, e.g. via the documented
+   * node.remove() pattern. The iterator then never visits the detached
+   * subtree, and the node is not recorded in DOMPurify.removed. On the
+   * IN_PLACE path the caller built that subtree in the live document, so a
+   * descendant that already started loading (e.g. <img src=x onerror=...>)
+   * keeps its queued handler and fires in page scope after sanitize
+   * returns, even though the handler never reached the returned tree.
+   * Neutralize the detached subtree before the walk moves on. The walk root
+   * is exempt: a detached IN_PLACE root is legitimate input and keeps being
+   * sanitized by the walk itself.
+   *
+   * @param  {Node} node the node a hook was just run on
+   * @param  {Node} root the root of the current walk
+   * @return {Boolean} true if the node was detached and neutralized
+   */
+  const _neutralizeHookDetachedNode = function (node, root) {
+    if (!IN_PLACE || node === root || getParentNode(node) !== null) {
+      return false;
+    }
+
+    _neutralizeSubtree(node);
+    return true;
+  };
+
+  /**
    * _sanitizeElements
    *
    * @protect nodeName
@@ -1179,13 +1281,19 @@ function createDOMPurify(window = getGlobal()) {
    * @protect removeChild
    *
    * @param   {Node} currentNode to check for permission to exist
+   * @param   {Node} root the root of the current walk
    * @return  {Boolean} true if node was killed, false if left alive
    */
-  const _sanitizeElements = function (currentNode) {
+  const _sanitizeElements = function (currentNode, root) {
     let content;
 
     /* Execute a hook if present */
     _executeHook('beforeSanitizeElements', currentNode, null);
+
+    /* The hook may have detached the node. On the IN_PLACE path,
+       neutralize the detached subtree so a queued resource handler on it
+       cannot fire in page scope after we return. */
+    _neutralizeHookDetachedNode(currentNode, root);
 
     /* Check if element is clobbered or can clobber */
     if (_isClobbered(currentNode)) {
@@ -1211,6 +1319,11 @@ function createDOMPurify(window = getGlobal()) {
       tagName,
       allowedTags: ALLOWED_TAGS,
     });
+
+    /* Same detach re-check as after beforeSanitizeElements: a hook-detached
+       node is not recorded in DOMPurify.removed and the iterator never
+       visits its descendants (see _neutralizeHookDetachedNode). */
+    _neutralizeHookDetachedNode(currentNode, root);
 
     /* Detect mXSS attempts abusing namespace confusion */
     if (
@@ -1274,6 +1387,11 @@ function createDOMPurify(window = getGlobal()) {
            deliberately skipped namespace and fallback-tag removal checks stay
            skipped; they are removal decisions, not the hook contract. */
         _executeHook('afterSanitizeElements', currentNode, null);
+
+        /* The hook may have detached the kept custom element. Same
+           IN_PLACE hazard as the before/upon sites: neutralize the
+           detached subtree before the walker skips past it. */
+        _neutralizeHookDetachedNode(currentNode, root);
 
         return false;
       }
@@ -1345,6 +1463,13 @@ function createDOMPurify(window = getGlobal()) {
 
     /* Execute a hook if present */
     _executeHook('afterSanitizeElements', currentNode, null);
+
+    /* The afterSanitizeElements hook is the documented place for
+       node.remove() policies, and a detach here is invisible to every later
+       pass: the iterator advances past the detached subtree, so its
+       descendants are never visited. Apply the same detach-neutralization
+       as the before/upon sites. */
+    _neutralizeHookDetachedNode(currentNode, root);
 
     return false;
   };
@@ -1465,14 +1590,27 @@ function createDOMPurify(window = getGlobal()) {
    * @protect setAttribute
    *
    * @param  {Node} currentNode to sanitize
+   * @param  {Node} root the root of the current walk
    */
-  const _sanitizeAttributes = function (currentNode) {
+  const _sanitizeAttributes = function (currentNode, root) {
     let attr;
     let value;
     let lcName;
     let l;
+    /* The attribute hooks can detach the node exactly like the element
+       hooks can. Only a detach by the hook itself is handled here: a node
+       _sanitizeElements already removed is DOMPurify's own removal, so the
+       attachment is sampled before each hook runs. */
+    let attachedBeforeHook = IN_PLACE && getParentNode(currentNode) !== null;
+
     /* Execute a hook if present */
     _executeHook('beforeSanitizeAttributes', currentNode, null);
+
+    /* On the IN_PLACE path, neutralize a subtree the hook detached (see
+       _neutralizeHookDetachedNode for the full rationale). */
+    if (attachedBeforeHook) {
+      _neutralizeHookDetachedNode(currentNode, root);
+    }
 
     const { attributes } = currentNode;
 
@@ -1612,8 +1750,17 @@ function createDOMPurify(window = getGlobal()) {
       } catch (_) {}
     }
 
+    attachedBeforeHook = IN_PLACE && getParentNode(currentNode) !== null;
+
     /* Execute a hook if present */
     _executeHook('afterSanitizeAttributes', currentNode, null);
+
+    /* Same detach re-check as after beforeSanitizeAttributes: this is the
+       last hook that runs for the node, so a detach here would otherwise
+       hand the caller a live, handler-bearing subtree. */
+    if (attachedBeforeHook) {
+      _neutralizeHookDetachedNode(currentNode, root);
+    }
   };
 
   /**
@@ -1632,10 +1779,10 @@ function createDOMPurify(window = getGlobal()) {
       /* Execute a hook if present */
       _executeHook('uponSanitizeShadowNode', shadowNode, null);
       /* Sanitize tags and elements */
-      _sanitizeElements(shadowNode);
+      _sanitizeElements(shadowNode, fragment);
 
       /* Check attributes next */
-      _sanitizeAttributes(shadowNode);
+      _sanitizeAttributes(shadowNode, fragment);
 
       /* Deep shadow DOM detected.
          Realm-safe check (GHSA-hpcv-96wg-7vj8): use nodeType against the
@@ -1834,7 +1981,8 @@ function createDOMPurify(window = getGlobal()) {
     }
 
     /* Get node iterator */
-    const nodeIterator = _createIterator(IN_PLACE ? dirty : body);
+    const walkRoot = IN_PLACE ? dirty : body;
+    const nodeIterator = _createIterator(walkRoot);
 
     /* Now start iterating over the created document */
     while ((currentNode = nodeIterator.nextNode())) {
@@ -1844,10 +1992,10 @@ function createDOMPurify(window = getGlobal()) {
       }
 
       /* Sanitize tags and elements */
-      _sanitizeElements(currentNode);
+      _sanitizeElements(currentNode, walkRoot);
 
       /* Check attributes next */
-      _sanitizeAttributes(currentNode);
+      _sanitizeAttributes(currentNode, walkRoot);
 
       /* Shadow DOM detected, sanitize it.
          Realm-safe check (GHSA-hpcv-96wg-7vj8): nodeType-based detection
