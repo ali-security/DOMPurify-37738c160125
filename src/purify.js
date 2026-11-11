@@ -154,6 +154,10 @@ function createDOMPurify(window = getGlobal()) {
     Node && Node.prototype ? lookupGetter(Node.prototype, 'nodeType') : null;
   const getNodeName =
     Node && Node.prototype ? lookupGetter(Node.prototype, 'nodeName') : null;
+  const getShadowRoot =
+    'shadowRoot' in ElementPrototype
+      ? lookupGetter(ElementPrototype, 'shadowRoot')
+      : null;
 
   // As per issue #47, the web-components registry is inherited by a
   // new document created via createHTMLDocument. As per the spec
@@ -1595,6 +1599,27 @@ function createDOMPurify(window = getGlobal()) {
          recurse into <template>.content from foreign realms too. */
       if (_isDocumentFragment(shadowNode.content)) {
         _sanitizeShadowDOM(shadowNode.content);
+      }
+
+      /* An element iterated here may itself host an attached
+         shadow root. The default NodeIterator does not enter shadow
+         trees, so a shadow root nested inside template.content was
+         previously reached by no walk at all (the template-content
+         recursion above iterates the content but never inspected
+         shadowRoot). Walk it explicitly; the recursion also covers
+         shadow roots and templates nested deeper inside it. The
+         nodeType guard avoids reading shadowRoot off text / comment /
+         CDATA / PI nodes that the iterator also surfaces. */
+      const shadowNodeType = getNodeType
+        ? getNodeType(shadowNode)
+        : shadowNode.nodeType;
+      if (shadowNodeType === 1) {
+        const innerSr = getShadowRoot
+          ? getShadowRoot(shadowNode)
+          : shadowNode.shadowRoot;
+        if (_isDocumentFragment(innerSr)) {
+          _sanitizeShadowDOM(innerSr);
+        }
       }
     }
 
