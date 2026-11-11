@@ -3165,6 +3165,111 @@
       }
     );
 
+    // An allowed <animate>/<set> must not be able to retarget a link's href:
+    // attributeName values containing "href" are dropped. In XHTML mode the
+    // attribute name keeps its case (attributeName), so the guard has to
+    // compare it case-insensitively; with values="x;javascript:..." the last
+    // list entry passes the URI check and becomes the link's effective href
+    // (GHSA-c6gr-qvv4-5v3f).
+    QUnit.test(
+      'CVE-2026-116803: animated href is blocked in every parser mode (attributeName guard)',
+      function (assert) {
+        var svgNs = 'xmlns="http://www.w3.org/2000/svg"';
+        var animate =
+          '<svg ' +
+          svgNs +
+          '><a id="q"><animate attributeName="href" ' +
+          'values="x;javascript:alert(1)" dur="0.01s" fill="freeze"/>' +
+          '<text x="10" y="40">click</text></a></svg>';
+        var set =
+          '<svg ' +
+          svgNs +
+          '><a><set attributeName="href" to="x" fill="freeze"/>' +
+          '<text>click</text></a></svg>';
+        var animAttrs = ['values', 'dur', 'fill', 'x', 'y', 'id', 'to'];
+        var configs = [
+          {
+            label: 'XHTML, camelCase ALLOWED_ATTR',
+            cfg: {
+              PARSER_MEDIA_TYPE: 'application/xhtml+xml',
+              ALLOWED_TAGS: ['svg', 'a', 'animate', 'set', 'text'],
+              ALLOWED_ATTR: ['attributeName'].concat(animAttrs),
+            },
+          },
+          {
+            label: 'XHTML, svg profile + ADD_ATTR',
+            cfg: {
+              PARSER_MEDIA_TYPE: 'application/xhtml+xml',
+              USE_PROFILES: { svg: true },
+              ADD_TAGS: ['animate', 'set'],
+              ADD_ATTR: ['attributeName'].concat(animAttrs),
+            },
+          },
+          {
+            label: 'text/html',
+            cfg: {
+              ALLOWED_TAGS: ['svg', 'a', 'animate', 'set', 'text'],
+              ALLOWED_ATTR: ['attributename'].concat(animAttrs),
+            },
+          },
+        ];
+
+        configs.forEach(function (config) {
+          [animate, set].forEach(function (dirty) {
+            var clean = DOMPurify.sanitize(dirty, config.cfg);
+            assert.notOk(
+              /attributename/i.test(clean),
+              config.label + ': href-targeting attributeName removed: ' + clean
+            );
+          });
+        });
+      }
+    );
+
+    QUnit.test(
+      'CVE-2026-116803: XHTML attributeName that does not target href is kept',
+      function (assert) {
+        // The guard must not over-strip ordinary SVG animations.
+        var clean = DOMPurify.sanitize(
+          '<svg xmlns="http://www.w3.org/2000/svg"><rect width="10" height="10">' +
+            '<animate attributeName="opacity" values="0;1" dur="1s"/></rect></svg>',
+          {
+            PARSER_MEDIA_TYPE: 'application/xhtml+xml',
+            USE_PROFILES: { svg: true },
+            ADD_TAGS: ['animate'],
+            ADD_ATTR: ['attributeName', 'values', 'dur'],
+          }
+        );
+        assert.ok(
+          /attributeName="opacity"/.test(clean),
+          'non-href animation kept: ' + clean
+        );
+      }
+    );
+
+    QUnit.test(
+      'CVE-2026-116803: XHTML removed <foreignObject> drops its content like in HTML mode',
+      function (assert) {
+        // FORBID_CONTENTS lists `foreignobject`; in XHTML mode the element is
+        // spelled foreignObject, and its content used to be hoisted into the
+        // SVG parent instead of being dropped.
+        var dirty =
+          '<svg xmlns="http://www.w3.org/2000/svg"><foreignObject>' +
+          '<title>hoisted</title><desc>hoisted</desc>' +
+          '</foreignObject></svg>';
+        ['text/html', 'application/xhtml+xml'].forEach(function (type) {
+          var clean = DOMPurify.sanitize(dirty, {
+            PARSER_MEDIA_TYPE: type,
+            USE_PROFILES: { svg: true },
+          });
+          assert.notOk(
+            /hoisted/.test(clean),
+            type + ': foreignObject content dropped: ' + clean
+          );
+        });
+      }
+    );
+
     // ---------------------------------------------------------------------------
     // GHSA-hpcv-96wg-7vj8 - cross-realm IN_PLACE sanitization. Foreign-realm
     // nodes (e.g. <form>, <template> from a same-origin iframe document) reach
@@ -4790,5 +4895,504 @@
         }
       );
     });
+
+    // ---------------------------------------------------------------------------
+    // CVE-2026-116803 (GHSA-mrv2-3pqr-j5jr, incomplete fix for
+    // GHSA-p98j-92pf-mc4p / CVE-2026-75838): the inline neutralize above only
+    // notices a hook detaching the node it was called for. A hook that
+    // detaches some OTHER node - the current node's parent or a further
+    // ancestor, a sibling the walk has not reached yet, an unrelated
+    // not-yet-visited subtree, or a subtree it moves out of the root - takes
+    // that subtree out of the walker's reach unsanitized, and it is not in
+    // DOMPurify.removed either. The IN_PLACE exit now neutralizes every
+    // element that was under the root when sanitize() started and is no
+    // longer under it, whatever detached it. A node moved from a
+    // not-yet-visited position to one the walker already passed is re-walked
+    // before sanitize() returns.
+    // ---------------------------------------------------------------------------
+
+    QUnit.module(
+      'IN_PLACE: nodes detached or moved by other nodes (CVE-2026-116803)',
+      function (hooks) {
+        var purify;
+        hooks.beforeEach(function () {
+          purify = DOMPurify(window);
+        });
+        hooks.afterEach(function () {
+          purify.removeAllHooks();
+          purify.clearConfig();
+        });
+
+        var _defineReactingElement = function (name, onAttributeRemoved) {
+          // ES5 constructor + Reflect.construct: the suite is transpiled, and
+          // a transpiled class can not extend HTMLElement. Defined once, the
+          // suite runs against both src and dist in the same window.
+          if (window.customElements.get(name)) {
+            return;
+          }
+
+          var Reacting = function () {
+            return Reflect.construct(window.HTMLElement, [], Reacting);
+          };
+
+          Reacting.prototype = Object.create(window.HTMLElement.prototype);
+          Reacting.prototype.constructor = Reacting;
+          Object.setPrototypeOf(Reacting, window.HTMLElement);
+          Object.defineProperty(Reacting, 'observedAttributes', {
+            get: function () {
+              return ['onclick'];
+            },
+          });
+          Reacting.prototype.attributeChangedCallback = function (
+            attrName,
+            oldValue,
+            newValue
+          ) {
+            if (newValue === null) {
+              onAttributeRemoved(this);
+            }
+          };
+
+          window.customElements.define(name, Reacting);
+        };
+
+        var _customElementsSupported = function () {
+          return (
+            typeof window.customElements !== 'undefined' &&
+            typeof Reflect !== 'undefined' &&
+            typeof Reflect.construct === 'function'
+          );
+        };
+
+        [
+          'uponSanitizeElement',
+          'beforeSanitizeElements',
+          'afterSanitizeElements',
+          'beforeSanitizeAttributes',
+          'afterSanitizeAttributes',
+        ].forEach(function (hook) {
+          QUnit.test(
+            'CVE-2026-116803: IN_PLACE ' +
+              hook +
+              ' detaching a node other than its own neutralizes it',
+            function (assert) {
+              var elsewhere = document.createElement('div');
+              // Element references are captured up front rather than read via
+              // nextElementSibling, which not every DOM implementation provides.
+              var shapes = {
+                parent: function (refs) {
+                  refs.figure.remove();
+                },
+                ancestor: function (refs) {
+                  refs.section.remove();
+                },
+                'later sibling': function (refs) {
+                  refs.tail.remove();
+                },
+                'unvisited subtree': function (refs) {
+                  refs.far.remove();
+                },
+                'moved out of root': function (refs) {
+                  elsewhere.appendChild(refs.figure);
+                },
+              };
+
+              Object.keys(shapes).forEach(function (shape) {
+                var root = document.createElement('div');
+                root.innerHTML =
+                  '<section><figure><i></i>' +
+                  '<img id="tail" onerror="alert(1)"></figure></section>' +
+                  '<p>ok</p>' +
+                  '<aside id="far"><img id="far-tail" onerror="alert(2)"></aside>';
+                var refs = {
+                  section: root.querySelector('section'),
+                  figure: root.querySelector('figure'),
+                  tail: root.querySelector('#tail'),
+                  far: root.querySelector('#far'),
+                };
+                var tail = refs.tail;
+                var farTail = root.querySelector('#far-tail');
+                var fired = false;
+
+                purify.addHook(hook, function (node) {
+                  if (!fired && node.nodeName === 'I') {
+                    fired = true;
+                    shapes[shape](refs);
+                  }
+                });
+
+                try {
+                  purify.sanitize(root, { IN_PLACE: true });
+                  assert.ok(fired, shape + ': hook ran');
+                  assert.strictEqual(
+                    tail.getAttribute('onerror'),
+                    null,
+                    shape + ': handler stripped from #tail'
+                  );
+                  assert.strictEqual(
+                    farTail.getAttribute('onerror'),
+                    null,
+                    shape + ': handler stripped from #far-tail'
+                  );
+                } finally {
+                  purify.removeAllHooks();
+                }
+              });
+            }
+          );
+        });
+
+        QUnit.test(
+          'CVE-2026-116803: IN_PLACE detached parent leaves no loading handler to fire after sanitize',
+          function (assert) {
+            var done = assert.async();
+            var sentinel = '__cve116803_parent';
+            window[sentinel] = 0;
+
+            // The <img> starts loading (and fails) as soon as the markup is
+            // parsed in the live document, before sanitize runs; its error
+            // event is queued and fires after sanitize returns.
+            var root = document.createElement('div');
+            root.innerHTML =
+              '<figure><img class="bad" src="data:,x">' +
+              '<img src="data:,y" onerror="window.' +
+              sentinel +
+              ' = 1"></figure><p>ok</p>';
+
+            purify.addHook('afterSanitizeAttributes', function (node) {
+              if (node.nodeName === 'IMG' && node.className === 'bad') {
+                node.parentNode.remove();
+              }
+            });
+
+            var ret = purify.sanitize(root, { IN_PLACE: true });
+
+            assert.equal(ret, root, 'returns the same in-place node');
+            assert.notOk(
+              root.querySelector('figure, img'),
+              'detached subtree is absent from the returned tree'
+            );
+
+            setTimeout(function () {
+              assert.strictEqual(
+                window[sentinel],
+                0,
+                'handler of the <img> under the hook-detached parent must not fire'
+              );
+              delete window[sentinel];
+              done();
+            }, 500);
+          }
+        );
+
+        QUnit.test(
+          'CVE-2026-116803: IN_PLACE uponSanitizeShadowNode detaching a sibling neutralizes it',
+          function (assert) {
+            // uponSanitizeShadowNode runs while <template>.content is walked,
+            // before the main walk reaches the template's later siblings.
+            var root = document.createElement('div');
+            root.innerHTML =
+              '<template><i></i></template>' +
+              '<b><img id="tail" onerror="alert(1)"></b><p>ok</p>';
+            var tail = root.querySelector('#tail');
+            var sibling = root.querySelector('b');
+            var fired = false;
+
+            purify.addHook('uponSanitizeShadowNode', function (node) {
+              if (node.nodeName === 'I' && sibling.parentNode) {
+                fired = true;
+                sibling.remove();
+              }
+            });
+
+            purify.sanitize(root, { IN_PLACE: true });
+            assert.ok(fired, 'hook ran');
+            assert.strictEqual(
+              tail.getAttribute('onerror'),
+              null,
+              'handler stripped from the sibling a shadow-node hook detached'
+            );
+          }
+        );
+
+        QUnit.test(
+          'CVE-2026-116803: IN_PLACE a custom element reaction detaching a sibling neutralizes it, no hook involved',
+          function (assert) {
+            // DOMPurify's own removeAttribute('onclick') on an allowed custom
+            // element runs the page's attributeChangedCallback synchronously,
+            // which detaches the next sibling before the walk reaches it.
+            if (!_customElementsSupported()) {
+              assert.ok(true, 'SKIP: no custom elements in this engine');
+              return;
+            }
+
+            _defineReactingElement('inplace-sibling-surgeon', function (el) {
+              var next = el.nextSibling;
+              if (next && next.parentNode) {
+                next.parentNode.removeChild(next);
+              }
+            });
+
+            var root = document.createElement('div');
+            // Connected, so the element is upgraded and its reactions run.
+            document.body.appendChild(root);
+            root.innerHTML =
+              '<inplace-sibling-surgeon onclick="x"></inplace-sibling-surgeon>' +
+              '<b><img id="tail" onerror="alert(1)"></b>';
+            var tail = root.querySelector('#tail');
+
+            try {
+              purify.sanitize(root, {
+                IN_PLACE: true,
+                CUSTOM_ELEMENT_HANDLING: { tagNameCheck: /^inplace-/ },
+              });
+              assert.strictEqual(
+                tail.getAttribute('onerror'),
+                null,
+                'handler stripped from the sibling a reaction detached'
+              );
+            } finally {
+              root.parentNode.removeChild(root);
+            }
+          }
+        );
+
+        QUnit.test(
+          "CVE-2026-116803: IN_PLACE a node another node's hook detached is neutralized on the abort path too",
+          function (assert) {
+            var root = document.createElement('div');
+            root.innerHTML =
+              '<figure><i></i><img id="tail" onerror="alert(1)"></figure><p>ok</p>';
+            var tail = root.querySelector('#tail');
+
+            purify.addHook('afterSanitizeAttributes', function (node) {
+              if (node.nodeName === 'I') {
+                node.parentNode.remove();
+                throw new Error('hook failure after detaching');
+              }
+            });
+
+            assert.throws(
+              function () {
+                purify.sanitize(root, { IN_PLACE: true });
+              },
+              /hook failure after detaching/,
+              'the hook error propagates'
+            );
+            assert.strictEqual(
+              tail.getAttribute('onerror'),
+              null,
+              'handler stripped before the rethrow'
+            );
+          }
+        );
+
+        // The walker only moves forward. A node that a hook or a page
+        // custom-element reaction moves from a not-yet-visited position to
+        // one the walker already passed is never visited, and since it is
+        // still under the root, the escaped-node pass does not touch it
+        // either: it used to stay in the RETURNED tree with its handlers,
+        // URLs and disallowed tags intact.
+        QUnit.test(
+          'CVE-2026-116803: IN_PLACE a node a hook moves behind the walker is still sanitized',
+          function (assert) {
+            var root = document.createElement('div');
+            root.innerHTML =
+              '<p>a</p><i></i>' +
+              '<span id="later"><img id="tail" onerror="alert(1)">' +
+              '<a id="link" href="javascript:alert(2)">x</a>' +
+              '<iframe srcdoc="x"></iframe></span>';
+            var later = root.querySelector('#later');
+            var tail = root.querySelector('#tail');
+            var link = root.querySelector('#link');
+
+            purify.addHook('afterSanitizeAttributes', function (node) {
+              if (node.nodeName === 'I') {
+                root.insertBefore(later, root.firstChild);
+              }
+            });
+
+            purify.sanitize(root, { IN_PLACE: true });
+            assert.equal(root.firstChild, later, 'the moved node stays put');
+            assert.strictEqual(
+              tail.getAttribute('onerror'),
+              null,
+              'handler stripped from the moved subtree'
+            );
+            assert.strictEqual(
+              link.getAttribute('href'),
+              null,
+              'javascript: URL stripped from the moved subtree'
+            );
+            assert.notOk(
+              root.querySelector('iframe'),
+              'disallowed element removed from the moved subtree'
+            );
+          }
+        );
+
+        QUnit.test(
+          'CVE-2026-116803: IN_PLACE a node an uponSanitizeShadowNode hook moves behind the walker is still sanitized',
+          function (assert) {
+            var root = document.createElement('div');
+            root.innerHTML =
+              '<p>a</p><template><i></i></template>' +
+              '<span><img id="tail" onerror="alert(1)"></span>';
+            var span = root.querySelector('span');
+            var tail = root.querySelector('#tail');
+
+            purify.addHook('uponSanitizeShadowNode', function (node) {
+              if (node.nodeName === 'I') {
+                root.insertBefore(span, root.firstChild);
+              }
+            });
+
+            purify.sanitize(root, { IN_PLACE: true });
+            assert.equal(root.firstChild, span, 'the moved node stays put');
+            assert.strictEqual(
+              tail.getAttribute('onerror'),
+              null,
+              'handler stripped from the moved subtree'
+            );
+          }
+        );
+
+        QUnit.test(
+          'CVE-2026-116803: IN_PLACE a custom element reaction moving a sibling behind the walker is still sanitized, no hook involved',
+          function (assert) {
+            if (!_customElementsSupported()) {
+              assert.ok(true, 'SKIP: no custom elements in this engine');
+              return;
+            }
+
+            _defineReactingElement('inplace-sibling-hoister', function (el) {
+              var next = el.nextSibling;
+              if (next) {
+                el.parentNode.insertBefore(next, el);
+              }
+            });
+
+            var root = document.createElement('div');
+            document.body.appendChild(root);
+            root.innerHTML =
+              '<inplace-sibling-hoister onclick="x"></inplace-sibling-hoister>' +
+              '<b><img id="tail" onerror="alert(1)"></b>';
+            var tail = root.querySelector('#tail');
+
+            try {
+              purify.sanitize(root, {
+                IN_PLACE: true,
+                CUSTOM_ELEMENT_HANDLING: { tagNameCheck: /^inplace-/ },
+              });
+              assert.strictEqual(
+                tail.getAttribute('onerror'),
+                null,
+                'handler stripped from the sibling the reaction moved'
+              );
+            } finally {
+              root.parentNode.removeChild(root);
+            }
+          }
+        );
+
+        QUnit.test(
+          'CVE-2026-116803: IN_PLACE nodes a hook creates behind the walker are left alone',
+          function (assert) {
+            // Only the caller's original nodes are re-walked; content a hook
+            // inserts itself stays the hook's responsibility, as before.
+            var root = document.createElement('div');
+            root.innerHTML = '<p>a</p><i></i>';
+
+            purify.addHook('afterSanitizeAttributes', function (node) {
+              if (node.nodeName === 'I') {
+                var mark = document.createElement('mark');
+                mark.setAttribute('data-from-hook', '1');
+                mark.setAttribute('onclick', 'trusted()');
+                root.insertBefore(mark, root.firstChild);
+              }
+            });
+
+            purify.sanitize(root, { IN_PLACE: true });
+            var mark = root.querySelector('mark');
+            assert.ok(mark, 'hook-created node kept');
+            assert.equal(
+              mark.getAttribute('onclick'),
+              'trusted()',
+              'hook-created node not re-sanitized'
+            );
+          }
+        );
+
+        QUnit.test(
+          'CVE-2026-116803: IN_PLACE a tree that keeps changing behind the walker fails closed',
+          function (assert) {
+            // A hook that, for every node it sees, moves one node it has not
+            // seen behind the walker roughly halves the pending set per
+            // round, so 2000 nodes need more rounds than the cap allows.
+            var root = document.createElement('div');
+            root.innerHTML = new Array(2001).join(
+              '<b><img onerror="alert(1)"></b>'
+            );
+            var imgs = root.querySelectorAll('img');
+            var seenMark = '__cve116803Seen';
+
+            purify.addHook('afterSanitizeAttributes', function (node) {
+              if (node.nodeName !== 'B') {
+                return;
+              }
+
+              node[seenMark] = true;
+              for (
+                var child = root.lastChild;
+                child;
+                child = child.previousSibling
+              ) {
+                if (!child[seenMark]) {
+                  root.insertBefore(child, root.firstChild);
+                  break;
+                }
+              }
+            });
+
+            assert.throws(
+              function () {
+                purify.sanitize(root, { IN_PLACE: true });
+              },
+              /kept changing/,
+              'refuses to return a tree that will not settle'
+            );
+            assert.equal(root.childNodes.length, 0, 'root stripped bare');
+            var armed = 0;
+            for (var i = 0; i < imgs.length; i++) {
+              if (imgs[i].getAttribute('onerror') !== null) {
+                armed++;
+              }
+            }
+
+            assert.equal(armed, 0, 'no handler left armed anywhere');
+          }
+        );
+
+        QUnit.test(
+          'CVE-2026-116803: IN_PLACE without hooks the result is unchanged',
+          function (assert) {
+            // Guard: nothing moves or leaves the tree, so neither new pass
+            // changes the outcome of a plain in-place sanitization.
+            var root = document.createElement('div');
+            root.innerHTML =
+              '<p title="t">a<img alt="x" onerror="alert(1)"></p>' +
+              '<a href="https://example.com/">b</a><script>alert(2)</script>';
+
+            var ret = purify.sanitize(root, { IN_PLACE: true });
+            assert.equal(ret, root, 'returns the same in-place node');
+            assert.equal(
+              root.innerHTML,
+              '<p title="t">a<img alt="x"></p>' +
+                '<a href="https://example.com/">b</a>'
+            );
+          }
+        );
+      }
+    );
   };
 });

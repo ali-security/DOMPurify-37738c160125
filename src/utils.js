@@ -39,6 +39,32 @@ const arrayPop = unapply(Array.prototype.pop);
 const arrayPush = unapply(Array.prototype.push);
 const arraySlice = unapply(Array.prototype.slice);
 
+/* Identity sets of nodes. Native Set where available; an array-backed
+   fallback otherwise (legacy engines without Set, e.g. IE10). */
+const NativeSet = typeof Set === 'function' ? Set : null;
+const nativeSetAdd = NativeSet ? unapply(NativeSet.prototype.add) : null;
+const nativeSetHas = NativeSet ? unapply(NativeSet.prototype.has) : null;
+
+const setCreate = function () {
+  return NativeSet ? construct(NativeSet, []) : { items: [] };
+};
+
+const setAdd = function (set, value) {
+  if (nativeSetAdd) {
+    nativeSetAdd(set, value);
+  } else if (arrayIndexOf(set.items, value) === -1) {
+    arrayPush(set.items, value);
+  }
+
+  return set;
+};
+
+const setHas = function (set, value) {
+  return nativeSetHas
+    ? nativeSetHas(set, value)
+    : arrayIndexOf(set.items, value) !== -1;
+};
+
 const stringToLowerCase = unapply(String.prototype.toLowerCase);
 const stringToString = unapply(String.prototype.toString);
 const stringMatch = unapply(String.prototype.match);
@@ -149,6 +175,10 @@ export {
   seal,
   // RegExp
   regExpTest,
+  // Set
+  setAdd,
+  setCreate,
+  setHas,
   // String
   stringIndexOf,
   stringMatch,
