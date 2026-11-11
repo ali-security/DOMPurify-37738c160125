@@ -978,7 +978,18 @@ function createDOMPurify(window = getGlobal()) {
         typeof elm.setAttribute !== 'function' ||
         typeof elm.namespaceURI !== 'string' ||
         typeof elm.insertBefore !== 'function' ||
-        typeof elm.hasChildNodes !== 'function')
+        typeof elm.hasChildNodes !== 'function' ||
+        // HTMLFormElement has [LegacyOverrideBuiltIns]: a descendant named
+        // "childNodes" shadows the prototype getter. Direct reads of
+        // form.childNodes from a clobbered form return the named child
+        // instead of the real NodeList, so any walk that reads it directly
+        // skips the form's real children. Compare the direct read to the
+        // cached Node.prototype getter — when the form's named-property
+        // getter intercepts the read, the two values differ and we flag
+        // the form. This catches every clobbering child type (input,
+        // select, etc.) regardless of whether the named child happens to
+        // carry a numeric .length.
+        elm.childNodes !== getChildNodes(elm))
     );
   };
 
@@ -989,6 +1000,15 @@ function createDOMPurify(window = getGlobal()) {
    * @return {Boolean} true is object is a DOM node
    */
   const _isNode = function (object) {
+    /* A same-realm node stays a node even when a named descendant of a
+       form ([LegacyOverrideBuiltIns]) clobbers its nodeName or nodeType.
+       The duck-typed probe below would misreport such a form, sanitize()
+       would then stringify it and silently skip IN_PLACE sanitization of
+       the caller's tree. GHSA-r47g-fvhr-h676. */
+    if (typeof Node === 'function' && object instanceof Node) {
+      return true;
+    }
+
     return typeof Node === 'object'
       ? object instanceof Node
       : object &&
@@ -1573,6 +1593,19 @@ function createDOMPurify(window = getGlobal()) {
             'root node is forbidden and cannot be sanitized in-place'
           );
         }
+      }
+
+      /* Pre-flight the root through _isClobbered. The iterator-driven
+         removal path can not detach a parent-less root: _forceRemove
+         is a no-op on a node with no parent. A clobbered root would
+         then survive the main loop with its attributes uninspected,
+         because _sanitizeAttributes early-returns on _isClobbered.
+         Refuse to sanitize such a root the same way we refuse a
+         forbidden tag. GHSA-r47g-fvhr-h676. */
+      if (_isClobbered(dirty)) {
+        throw typeErrorCreate(
+          'root node is clobbered and cannot be sanitized in-place'
+        );
       }
     } else if (dirty instanceof Node) {
       /* If dirty is a DOM element, append to an empty document to avoid

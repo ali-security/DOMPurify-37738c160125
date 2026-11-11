@@ -828,6 +828,215 @@
         });
       }
     );
+
+    // GHSA-r47g-fvhr-h676 - parent-less clobbered IN_PLACE root retains
+    // attacker-controlled attributes. sanitize() must throw on a clobbered
+    // IN_PLACE root, the same way it throws on a forbidden root tag.
+    var _formClobberingSupportedR47g = function () {
+      var form = document.createElement('form');
+      var input = document.createElement('input');
+      input.setAttribute('name', 'nodeName');
+      form.appendChild(input);
+      return typeof form.nodeName !== 'string';
+    };
+    QUnit.test(
+      'GHSA-r47g-fvhr-h676: parent-less clobbered form root throws instead of returning the root with onmouseover intact',
+      function (assert) {
+        if (!_formClobberingSupportedR47g()) {
+          assert.ok(true, 'SKIP: no form clobbering in this engine');
+          return;
+        }
+
+        var root = document.createElement('form');
+        root.setAttribute('onmouseover', 'window.__rooted_h676 = 1');
+        var clobber = document.createElement('input');
+        clobber.setAttribute('name', 'nodeName');
+        root.appendChild(clobber);
+
+        assert.throws(function () {
+          DOMPurify.sanitize(root, { IN_PLACE: true });
+        }, 'clobbered parent-less IN_PLACE root must throw');
+      }
+    );
+    QUnit.test(
+      'GHSA-r47g-fvhr-h676: each clobbering name covered by _isClobbered triggers the IN_PLACE preamble throw',
+      function (assert) {
+        if (!_formClobberingSupportedR47g()) {
+          assert.ok(true, 'SKIP: no form clobbering in this engine');
+          return;
+        }
+
+        var clobberNames = [
+          'nodeName',
+          'setAttribute',
+          'namespaceURI',
+          'insertBefore',
+          'hasChildNodes',
+          'childNodes',
+          'attributes',
+          'textContent',
+          'removeChild',
+          'removeAttribute',
+        ];
+
+        clobberNames.forEach(function (name) {
+          var root = document.createElement('form');
+          root.setAttribute('onmouseover', 'window.__rooted_' + name + ' = 1');
+          var clobber = document.createElement('input');
+          clobber.setAttribute('name', name);
+          root.appendChild(clobber);
+
+          assert.throws(
+            function () {
+              DOMPurify.sanitize(root, { IN_PLACE: true });
+            },
+            /clobbered|forbidden/i,
+            'IN_PLACE preamble must throw for clobber name="' + name + '"'
+          );
+        });
+      }
+    );
+    QUnit.test(
+      'GHSA-r47g-fvhr-h676: clobbered form root is rejected regardless of allowlist',
+      function (assert) {
+        if (!_formClobberingSupportedR47g()) {
+          assert.ok(true, 'SKIP: no form clobbering in this engine');
+          return;
+        }
+
+        var allowedRoot = document.createElement('form');
+        var clobberA = document.createElement('input');
+        clobberA.setAttribute('name', 'setAttribute');
+        allowedRoot.appendChild(clobberA);
+        assert.throws(function () {
+          DOMPurify.sanitize(allowedRoot, { IN_PLACE: true });
+        }, 'allowed-tag clobbered root must throw');
+
+        var forbiddenRoot = document.createElement('form');
+        var clobberB = document.createElement('input');
+        clobberB.setAttribute('name', 'setAttribute');
+        forbiddenRoot.appendChild(clobberB);
+        assert.throws(function () {
+          DOMPurify.sanitize(forbiddenRoot, {
+            IN_PLACE: true,
+            FORBID_TAGS: ['form'],
+          });
+        }, 'forbidden-tag clobbered root must throw');
+      }
+    );
+    QUnit.test(
+      'GHSA-r47g-fvhr-h676: clobbered form root throws when attached and with any config',
+      function (assert) {
+        if (!_formClobberingSupportedR47g()) {
+          assert.ok(true, 'SKIP: no form clobbering in this engine');
+          return;
+        }
+
+        // An attached root is detached by _forceRemove but its attributes are
+        // still never inspected, so the caller would get back a form carrying
+        // javascript: actions, handlers and template expressions.
+        var wrapper = document.createElement('div');
+        var root = document.createElement('form');
+        root.setAttribute('action', 'javascript:alert(1)');
+        root.setAttribute('onfocus', 'window.__rooted_attached = 1');
+        root.setAttribute('title', '{{evil}}');
+        var clobber = document.createElement('input');
+        clobber.setAttribute('name', 'hasChildNodes');
+        root.appendChild(clobber);
+        wrapper.appendChild(root);
+
+        assert.throws(function () {
+          DOMPurify.sanitize(root, { IN_PLACE: true });
+        }, 'attached clobbered IN_PLACE root must throw');
+
+        assert.throws(function () {
+          DOMPurify.sanitize(root, {
+            IN_PLACE: true,
+            SAFE_FOR_TEMPLATES: true,
+          });
+        }, 'clobbered IN_PLACE root must throw with SAFE_FOR_TEMPLATES');
+      }
+    );
+    QUnit.test(
+      'GHSA-r47g-fvhr-h676: unclobbered form root is still sanitized in-place',
+      function (assert) {
+        // Guard against false positives of the childNodes probe: a form whose
+        // children do not shadow any inspected property must not throw.
+        var root = document.createElement('form');
+        root.setAttribute('onmouseover', 'window.__rooted_plain = 1');
+        root.setAttribute('action', 'javascript:alert(1)');
+        var input = document.createElement('input');
+        input.setAttribute('name', 'username');
+        root.appendChild(input);
+
+        var clean = DOMPurify.sanitize(root, { IN_PLACE: true });
+
+        assert.strictEqual(clean, root, 'root is returned in-place');
+        assert.notOk(
+          root.hasAttribute('onmouseover'),
+          'onmouseover removed from root'
+        );
+        assert.notOk(
+          root.hasAttribute('action'),
+          'javascript: action removed from root'
+        );
+        assert.equal(
+          root.querySelectorAll('input').length,
+          1,
+          'harmless input child is kept'
+        );
+      }
+    );
+    QUnit.test(
+      'GHSA-r47g-fvhr-h676: form clobbered by <select name="childNodes"> is still removed',
+      function (assert) {
+        if (!_formClobberingSupportedR47g()) {
+          assert.ok(true, 'SKIP: no form clobbering in this engine');
+          return;
+        }
+
+        var form = document.createElement('form');
+        var clobber = document.createElement('select');
+        clobber.setAttribute('name', 'childNodes');
+        form.appendChild(clobber);
+
+        var wrapper = document.createElement('div');
+        wrapper.appendChild(form);
+
+        DOMPurify.sanitize(wrapper, { IN_PLACE: true });
+
+        assert.equal(
+          wrapper.querySelectorAll('form').length,
+          0,
+          'form clobbered by <select name="childNodes"> must be removed'
+        );
+      }
+    );
+    QUnit.test(
+      'GHSA-r47g-fvhr-h676: a parented clobbered form is still sanitized normally (regression guard)',
+      function (assert) {
+        if (!_formClobberingSupportedR47g()) {
+          assert.ok(true, 'SKIP: no form clobbering in this engine');
+          return;
+        }
+
+        var wrapper = document.createElement('div');
+        var form = document.createElement('form');
+        form.setAttribute('onmouseover', 'window.__rooted_parented = 1');
+        var clobber = document.createElement('input');
+        clobber.setAttribute('name', 'nodeName');
+        form.appendChild(clobber);
+        wrapper.appendChild(form);
+
+        DOMPurify.sanitize(wrapper, { IN_PLACE: true });
+
+        assert.equal(
+          wrapper.querySelectorAll('form').length,
+          0,
+          'parented clobbered form is removed by the iterator-driven path'
+        );
+      }
+    );
     QUnit.test('Config-Flag tests: FORBID_TAGS', function (assert) {
       //FORBID_TAGS
       assert.equal(
