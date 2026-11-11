@@ -1500,6 +1500,50 @@
         ]
       );
     });
+    QUnit.test(
+      'Config-Flag tests: USE_PROFILES attribute allowlist does not inherit from prototypes (CVE-2026-65913)',
+      function (assert) {
+        var dirty = '<img src="x" onerror="alert(1)">';
+        var clean;
+
+        // An empty profile leaves ALLOWED_ATTR without any entries. It must
+        // not resolve attribute names through Array.prototype either.
+        assert.equal(
+          DOMPurify.sanitize('<img fill="x" map="x">', {
+            USE_PROFILES: {},
+            ADD_TAGS: ['img'],
+          }),
+          '<img>'
+        );
+
+        // Polluted Array.prototype must not allow event handlers
+        Array.prototype.onerror = true;
+        try {
+          clean = DOMPurify.sanitize(dirty, {
+            USE_PROFILES: {},
+            ADD_TAGS: ['img'],
+          });
+        } finally {
+          delete Array.prototype.onerror;
+        }
+
+        assert.equal(clean, '<img>');
+
+        // Polluted Object.prototype must not allow event handlers
+        Object.prototype.onerror = true;
+        try {
+          clean = DOMPurify.sanitize(dirty, {
+            USE_PROFILES: {},
+            ADD_TAGS: ['img'],
+            FORBID_ATTR: ['style'],
+          });
+        } finally {
+          delete Object.prototype.onerror;
+        }
+
+        assert.equal(clean, '<img>');
+      }
+    );
     QUnit.test('Config-Flag tests: ALLOWED_URI_REGEXP', function (assert) {
       var tests = [
         {
