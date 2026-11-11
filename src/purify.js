@@ -1075,6 +1075,34 @@ function createDOMPurify(window = getGlobal()) {
   };
 
   /**
+   * _getNodeName
+   *
+   * Reads the node name through the cached Node.prototype.nodeName getter.
+   *
+   * A live node handed in for IN_PLACE sanitization (e.g. from a same-
+   * origin iframe or popup, or adopted via document.adoptNode) can carry
+   * an own `nodeName` property that shadows the prototype getter, e.g. a
+   * real <script> defined to report "DIV". A direct `node.nodeName` read
+   * would then let the allowlist decision run against the spoofed name and
+   * keep the real element. The cached getter reads the internal slot and
+   * ignores such own properties. Only fall back to the direct read when
+   * the getter can not produce a name at all. GHSA-x4vx-rjvf-j5p4.
+   *
+   * @param  {Node} node node to read the name from
+   * @return {String} the node's real name
+   */
+  const _getNodeName = function (node) {
+    let nodeName = null;
+    if (getNodeName) {
+      try {
+        nodeName = getNodeName(node);
+      } catch (_) {}
+    }
+
+    return typeof nodeName === 'string' ? nodeName : node.nodeName;
+  };
+
+  /**
    * _isNode
    *
    * @param  {Node} obj object to check whether it's a DOM node
@@ -1165,14 +1193,18 @@ function createDOMPurify(window = getGlobal()) {
       return true;
     }
 
+    /* Read the real node name, an own `nodeName` property must not
+       be able to spoof it. GHSA-x4vx-rjvf-j5p4. */
+    const nodeName = _getNodeName(currentNode);
+
     /* Check if tagname contains Unicode */
-    if (regExpTest(/[\u0080-\uFFFF]/, currentNode.nodeName)) {
+    if (regExpTest(/[\u0080-\uFFFF]/, nodeName)) {
       _forceRemove(currentNode);
       return true;
     }
 
     /* Now let's check the element's type and name */
-    const tagName = transformCaseFunc(currentNode.nodeName);
+    const tagName = transformCaseFunc(nodeName);
 
     /* Execute a hook if present */
     _executeHook('uponSanitizeElement', currentNode, {
@@ -1496,7 +1528,7 @@ function createDOMPurify(window = getGlobal()) {
       }
 
       /* Is `value` valid for this attribute? */
-      const lcTag = transformCaseFunc(currentNode.nodeName);
+      const lcTag = transformCaseFunc(_getNodeName(currentNode));
       if (!_isValidAttribute(lcTag, lcName, value)) {
         continue;
       }
@@ -1720,9 +1752,14 @@ function createDOMPurify(window = getGlobal()) {
     }
 
     if (IN_PLACE) {
-      /* Do some early pre-sanitization to avoid unsafe root nodes */
-      if (dirty.nodeName) {
-        const tagName = transformCaseFunc(dirty.nodeName);
+      /* Do some early pre-sanitization to avoid unsafe root nodes.
+         Read the root's name through the cached getter: the main loop
+         can not detach a parent-less root, so a root spoofing its
+         nodeName (e.g. a <script> reporting "DIV") must be refused
+         here. GHSA-x4vx-rjvf-j5p4. */
+      const rootNodeName = _getNodeName(dirty);
+      if (rootNodeName) {
+        const tagName = transformCaseFunc(rootNodeName);
         if (!ALLOWED_TAGS[tagName] || FORBID_TAGS[tagName]) {
           throw typeErrorCreate(
             'root node is forbidden and cannot be sanitized in-place'

@@ -4055,5 +4055,171 @@
         );
       }
     );
+
+    // ---------------------------------------------------------------------------
+    // GHSA-x4vx-rjvf-j5p4 - IN_PLACE nodeName spoofing. A hostile live node
+    // (handed over by a same-origin iframe / popup, or adopted via
+    // document.adoptNode) can define an own `nodeName` property that shadows
+    // the Node.prototype getter. The allowlist decision used to read the
+    // instance property directly, so a real <script> reporting "DIV" was kept
+    // and executed once the tree was attached to the document.
+    // ---------------------------------------------------------------------------
+    var _spoofNodeNameX4vx = function (node, spoofedName) {
+      Object.defineProperty(node, 'nodeName', {
+        value: spoofedName,
+        configurable: true,
+      });
+      return node;
+    };
+
+    QUnit.test(
+      'GHSA-x4vx-rjvf-j5p4: <script> spoofing nodeName "DIV" is removed on IN_PLACE',
+      function (assert) {
+        window.__x4vx_fired = 0;
+        var host = document.createElement('div');
+        var script = document.createElement('script');
+        script.text = 'window.__x4vx_fired = 1;';
+        _spoofNodeNameX4vx(script, 'DIV');
+        host.appendChild(script);
+
+        assert.equal(script.nodeName, 'DIV', 'spoof is in effect');
+
+        var clean = DOMPurify.sanitize(host, { IN_PLACE: true });
+
+        assert.strictEqual(clean, host, 'host is returned in-place');
+        assert.equal(
+          host.getElementsByTagName('script').length,
+          0,
+          'real <script> reporting nodeName "DIV" must be removed'
+        );
+
+        document.body.appendChild(host);
+        document.body.removeChild(host);
+        assert.equal(
+          window.__x4vx_fired,
+          0,
+          'sanitized tree must not execute the payload once attached'
+        );
+      }
+    );
+
+    QUnit.test(
+      'GHSA-x4vx-rjvf-j5p4: accessor-based nodeName spoof does not keep a <script>',
+      function (assert) {
+        var host = document.createElement('div');
+        var script = document.createElement('script');
+        script.text = 'window.__x4vx_accessor = 1;';
+        Object.defineProperty(script, 'nodeName', {
+          get: function () {
+            return 'DIV';
+          },
+          configurable: true,
+        });
+        host.appendChild(script);
+
+        DOMPurify.sanitize(host, { IN_PLACE: true });
+
+        assert.equal(
+          host.getElementsByTagName('script').length,
+          0,
+          'getter-spoofed <script> must be removed'
+        );
+      }
+    );
+
+    QUnit.test(
+      'GHSA-x4vx-rjvf-j5p4: <a> spoofing nodeName "IMG" does not keep a data: href',
+      function (assert) {
+        var host = document.createElement('div');
+        var anchor = document.createElement('a');
+        anchor.setAttribute(
+          'href',
+          'data:text/html;base64,PHNjcmlwdD5hbGVydCgxKTwvc2NyaXB0Pg=='
+        );
+        _spoofNodeNameX4vx(anchor, 'IMG');
+        host.appendChild(anchor);
+
+        DOMPurify.sanitize(host, { IN_PLACE: true });
+
+        var kept = host.getElementsByTagName('a');
+        assert.equal(kept.length, 1, 'the <a> element itself is allowed');
+        assert.notOk(
+          kept[0].hasAttribute('href'),
+          'data: href is only valid for data-URI tags, not for a spoofed <a>'
+        );
+      }
+    );
+
+    QUnit.test(
+      'GHSA-x4vx-rjvf-j5p4: parent-less <script> root spoofing nodeName "DIV" throws on IN_PLACE',
+      function (assert) {
+        var script = document.createElement('script');
+        script.text = 'window.__x4vx_root = 1;';
+        _spoofNodeNameX4vx(script, 'DIV');
+
+        // The main loop can not detach a parent-less root, so the spoofed
+        // root must be refused by the pre-check.
+        assert.throws(
+          function () {
+            DOMPurify.sanitize(script, { IN_PLACE: true });
+          },
+          /forbidden/i,
+          'spoofed <script> root must be refused'
+        );
+      }
+    );
+
+    QUnit.test(
+      'GHSA-x4vx-rjvf-j5p4: spoofed <script> from a same-origin iframe is removed on IN_PLACE',
+      function (assert) {
+        var ran = _withForeignRealmDocHpcv(function (idoc, iwin) {
+          var host = idoc.createElement('div');
+          var script = idoc.createElement('script');
+          script.text = 'window.__x4vx_iframe = 1;';
+          iwin.Object.defineProperty(script, 'nodeName', {
+            value: 'DIV',
+            configurable: true,
+          });
+          host.appendChild(script);
+
+          DOMPurify.sanitize(host, { IN_PLACE: true });
+
+          assert.equal(
+            host.getElementsByTagName('script').length,
+            0,
+            'foreign-realm <script> reporting "DIV" must be removed'
+          );
+        });
+        if (!ran) {
+          assert.ok(true, 'SKIP: cannot construct a foreign-realm document');
+        }
+      }
+    );
+
+    QUnit.test(
+      'GHSA-x4vx-rjvf-j5p4: spoofed <script> adopted via document.adoptNode is removed on IN_PLACE',
+      function (assert) {
+        var ran = _withForeignRealmDocHpcv(function (idoc) {
+          var host = idoc.createElement('div');
+          var script = idoc.createElement('script');
+          script.text = 'window.__x4vx_adopted = 1;';
+          _spoofNodeNameX4vx(script, 'DIV');
+          host.appendChild(script);
+
+          var adopted = document.adoptNode(host);
+
+          DOMPurify.sanitize(adopted, { IN_PLACE: true });
+
+          assert.equal(
+            adopted.getElementsByTagName('script').length,
+            0,
+            'adopted <script> reporting "DIV" must be removed'
+          );
+        });
+        if (!ran) {
+          assert.ok(true, 'SKIP: cannot construct a foreign-realm document');
+        }
+      }
+    );
   };
 });
