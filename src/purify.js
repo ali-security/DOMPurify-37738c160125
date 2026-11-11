@@ -1252,18 +1252,30 @@ function createDOMPurify(window = getGlobal()) {
 
     /* Remove element if anything forbids its presence */
     if (!ALLOWED_TAGS[tagName] || FORBID_TAGS[tagName]) {
-      /* Check if we have a custom element to handle */
-      if (!FORBID_TAGS[tagName] && _basicCustomElementTest(tagName)) {
-        if (
-          CUSTOM_ELEMENT_HANDLING.tagNameCheck instanceof RegExp &&
-          regExpTest(CUSTOM_ELEMENT_HANDLING.tagNameCheck, tagName)
-        )
-          return false;
-        if (
-          CUSTOM_ELEMENT_HANDLING.tagNameCheck instanceof Function &&
-          CUSTOM_ELEMENT_HANDLING.tagNameCheck(tagName)
-        )
-          return false;
+      /* Check if we have a custom element to handle.
+         A false return keeps the custom element and exits early - the
+         namespace and fallback-tag removal checks below are intentionally
+         skipped for kept custom elements. */
+      if (
+        !FORBID_TAGS[tagName] &&
+        _basicCustomElementTest(tagName) &&
+        ((CUSTOM_ELEMENT_HANDLING.tagNameCheck instanceof RegExp &&
+          regExpTest(CUSTOM_ELEMENT_HANDLING.tagNameCheck, tagName)) ||
+          (CUSTOM_ELEMENT_HANDLING.tagNameCheck instanceof Function &&
+            CUSTOM_ELEMENT_HANDLING.tagNameCheck(tagName)))
+      ) {
+        /* Run afterSanitizeElements on the kept custom element so the
+           element-hook lifecycle matches normal allowlisted elements: a
+           security policy applied in this hook (e.g. stripping an attribute
+           from every surviving element) must not silently skip kept custom
+           elements (GHSA-c2j3-45gr-mqc4). This mirrors the normal-element
+           tail below - the hook runs, then the walker's subsequent
+           _sanitizeAttributes pass sanitizes the element's attributes. The
+           deliberately skipped namespace and fallback-tag removal checks stay
+           skipped; they are removal decisions, not the hook contract. */
+        _executeHook('afterSanitizeElements', currentNode, null);
+
+        return false;
       }
 
       /* Keep content except for bad-listed elements.
